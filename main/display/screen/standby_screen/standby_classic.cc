@@ -53,7 +53,9 @@ void StandbyClassic_ApplyWeatherUi() {
         lv_label_set_text(StandbyClassic_State().lunar_lbl, sub);
     }
     if (StandbyClassic_State().weather_text != nullptr) {
-        lv_label_set_text(StandbyClassic_State().weather_text, StandbyClassic_LocalizedPhenomText(snap));
+        char wl[48];
+        StandbyClassic_FormatWeatherLabel(wl, sizeof(wl));
+        lv_label_set_text(StandbyClassic_State().weather_text, wl[0] ? wl : StandbyClassic_LocalizedPhenomText(snap));
     }
     if (StandbyClassic_State().weather_temp != nullptr) {
         if (snap.has_temp) {

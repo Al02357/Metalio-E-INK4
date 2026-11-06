@@ -1,5 +1,8 @@
 #include "settings_haptic_tab.h"
 
+#include <cstdio>
+#include <string>
+
 #include "assets/lang_config.h"
 #include "fontpack_lvgl.h"
 #include "haptic_feedback.h"
@@ -11,37 +14,17 @@ struct SettingsHapticOption {
     const char* (*current_text)(); // 当前选中文案
 };
 
-struct SettingsHapticIntensityOption {
-    int intensity; // 0 弱 / 1 中 / 2 强
-    const char* (*title)(); // 选项标题
-    const char* (*current_text)(); // 当前选中文案
-};
-
 static const char* HapticTitleOn() { return Lang::Strings::SETTINGS_HAPTIC_ON; }
 static const char* HapticTitleOff() { return Lang::Strings::SETTINGS_HAPTIC_OFF; }
 static const char* HapticCurOn() { return Lang::Strings::SETTINGS_HAPTIC_CURRENT_ON; }
 static const char* HapticCurOff() { return Lang::Strings::SETTINGS_HAPTIC_CURRENT_OFF; }
-
-static const char* IntensityTitleWeak() { return Lang::Strings::SETTINGS_HAPTIC_WEAK; }
-static const char* IntensityTitleMedium() { return Lang::Strings::SETTINGS_HAPTIC_MEDIUM; }
-static const char* IntensityTitleStrong() { return Lang::Strings::SETTINGS_HAPTIC_STRONG; }
-static const char* IntensityCurWeak() { return Lang::Strings::SETTINGS_HAPTIC_CURRENT_WEAK; }
-static const char* IntensityCurMedium() { return Lang::Strings::SETTINGS_HAPTIC_CURRENT_MEDIUM; }
-static const char* IntensityCurStrong() { return Lang::Strings::SETTINGS_HAPTIC_CURRENT_STRONG; }
 
 static constexpr SettingsHapticOption kOptions[] = {
     {true, HapticTitleOn, HapticCurOn},
     {false, HapticTitleOff, HapticCurOff},
 };
 static constexpr int kOptionCount = sizeof(kOptions) / sizeof(kOptions[0]);
-
-static constexpr SettingsHapticIntensityOption kIntensityOptions[] = {
-    {0, IntensityTitleWeak, IntensityCurWeak},
-    {1, IntensityTitleMedium, IntensityCurMedium},
-    {2, IntensityTitleStrong, IntensityCurStrong},
-};
-static constexpr int kIntensityOptionCount =
-    sizeof(kIntensityOptions) / sizeof(kIntensityOptions[0]);
+static constexpr int kIntensityOptionCount = HAPTIC_LEVELS;
 
 struct SettingsHapticUi {
     lv_obj_t* btns[kOptionCount] = {}; // 开关选项按钮
@@ -61,13 +44,8 @@ static const char* CurrentText(bool enabled) {
     return kOptions[0].current_text();
 }
 
-static const char* IntensityCurrentText(int intensity) {
-    for (int i = 0; i < kIntensityOptionCount; ++i) {
-        if (kIntensityOptions[i].intensity == intensity) {
-            return kIntensityOptions[i].current_text();
-        }
-    }
-    return kIntensityOptions[0].current_text();
+static std::string IntensityCurrentText(int intensity) {
+    return "当前：第 " + std::to_string(intensity + 1) + " 档（共 " + std::to_string(HAPTIC_LEVELS) + " 档）";
 }
 
 static void RefreshOptions() {
@@ -86,12 +64,11 @@ static void RefreshOptions() {
     for (int i = 0; i < kIntensityOptionCount; ++i) {
         if (s_ui.intensity_btns[i] != nullptr) {
             SettingsStyleSelectable(s_ui.intensity_btns[i],
-                                    lv_obj_get_child(s_ui.intensity_btns[i], 0),
-                                    kIntensityOptions[i].intensity == intensity);
+                                    lv_obj_get_child(s_ui.intensity_btns[i], 0), i == intensity);
         }
     }
     if (s_ui.intensity_lbl != nullptr) {
-        lv_label_set_text(s_ui.intensity_lbl, IntensityCurrentText(intensity));
+        lv_label_set_text(s_ui.intensity_lbl, IntensityCurrentText(intensity).c_str());
     }
 }
 
@@ -115,6 +92,7 @@ static void OnIntensityClicked(lv_event_t* e) {
     }
     HapticSetIntensity(intensity);
     RefreshOptions();
+    HapticPulseIfEnabled();  // 选完马上震一下，感受新档位
 }
 
 void SettingsHapticTab_Reset() {
@@ -161,10 +139,21 @@ void SettingsHapticTab_Build(lv_obj_t* page) {
     lv_obj_set_style_text_color(intensity_title, lv_color_black(), 0);
     lv_obj_clear_flag(intensity_title, LV_OBJ_FLAG_CLICKABLE);
 
+    // 7 档：一行小按钮 1..7（左弱右强）
+    lv_obj_t* row = lv_obj_create(page);
+    lv_obj_remove_style_all(row);
+    lv_obj_set_size(row, lv_pct(100), 64);
+    lv_obj_clear_flag(row, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_set_flex_flow(row, LV_FLEX_FLOW_ROW);
+    lv_obj_set_flex_align(row, LV_FLEX_ALIGN_SPACE_BETWEEN, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
     for (int i = 0; i < kIntensityOptionCount; ++i) {
-        s_ui.intensity_btns[i] = SettingsCreateSelectableOption(
-            page, kIntensityOptions[i].title(), OnIntensityClicked,
-            static_cast<intptr_t>(kIntensityOptions[i].intensity));
+        char t[4];
+        std::snprintf(t, sizeof(t), "%d", i + 1);
+        lv_obj_t* b = SettingsCreateSelectableOption(row, t, OnIntensityClicked, static_cast<intptr_t>(i));
+        lv_obj_set_size(b, 52, 56);
+        lv_obj_t* l = lv_obj_get_child(b, 0);
+        if (l) lv_obj_center(l);
+        s_ui.intensity_btns[i] = b;
     }
 
     s_ui.intensity_lbl = lv_label_create(page);

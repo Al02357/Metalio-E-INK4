@@ -9,6 +9,8 @@ public:
     static lv_obj_t* Create();
     /** @brief 创建设置→测试子页 */
     static lv_obj_t* CreateTest();
+    /** @brief 直接打开设置→主题（含屏幕全刷设置） */
+    static lv_obj_t* CreateTheme();
     /** @brief 切换语言后重建设置页文案与布局 */
     static void ReloadAfterLanguageChange();
 };

@@ -1,4 +1,5 @@
 #include "standby_screen/standby_wallpaper.h"
+#include "standby_card.h"
 
 #include "wallpaper_screen/wallpaper_active.h"
 
@@ -104,7 +105,8 @@ static void LoadTask(void* arg) {
     delete work;
 
     char path[192] = {};
-    if (!Wallpaper_TryResolveStandbyWallpaperPath(path, sizeof(path))) {
+    if (!Wallpaper_TryResolveStandbyWallpaperPath(path, sizeof(path)) &&
+        !(Wallpaper_GetStandbyFilename().empty() && StandbyCard_TryPath(path, sizeof(path)))) {
         std::snprintf(msg->err, sizeof(msg->err), "%s", Lang::Strings::STANDBY_WP_NOT_FOUND);
     } else {
         auto* img = new reader::RasterImage();

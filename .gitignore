@@ -29,3 +29,6 @@ tools/epdfont/.venv/
 tools/fontpack/.venv/
 tools/ebook/.venv/
 
+
+tools/ble_voice/.venv/
+__pycache__/

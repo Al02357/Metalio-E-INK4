@@ -1,4 +1,5 @@
 #include "metalio_board_periph.h"
+#include <freertos/idf_additions.h>
 
 #include "bq27220_gauge.h"
 #include "config.h"
@@ -45,7 +46,7 @@ void MetalioPeriph_InitBtAudio() {
                 line.push_back('.');
             }
         }
-        ESP_LOGD(TAG, "BT RX (%u): %s", static_cast<unsigned>(data.size()), line.c_str());
+        ESP_LOGW(TAG, "BT RX (%u): %s", static_cast<unsigned>(data.size()), line.c_str());
     });
 
     // 开机默认蓝牙模式1（接收）
@@ -125,7 +126,8 @@ void MetalioPeriph_InitCx25601n(i2c_master_bus_handle_t bus) {
 }
 
 void MetalioPeriph_StartSystemMonitor() {
-    xTaskCreate(
+    // 栈放 PSRAM：只读电量计 / 堆信息、打日志，不写 Flash
+    xTaskCreateWithCaps(
         [](void*) {
             constexpr int kCoreCount = portNUM_PROCESSORS;
             configRUN_TIME_COUNTER_TYPE prev_idle[kCoreCount] = {};
@@ -210,5 +212,5 @@ void MetalioPeriph_StartSystemMonitor() {
                 last_loop_end_us = static_cast<uint64_t>(esp_timer_get_time());
             }
         },
-        "sys_mon", 4096, nullptr, 1, nullptr);
+        "sys_mon", 4096, nullptr, 1, nullptr, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
 }

@@ -35,6 +35,9 @@ public:
     inline int input_channels() const { return input_channels_; }
     inline int output_channels() const { return output_channels_; }
     inline int output_volume() const { return output_volume_; }
+    /** 一键静音（快捷面板）：不改保存的音量；每次开机默认静音（用户要求），按音量+ 解除 */
+    inline bool muted() const { return muted_; }
+    inline void SetMuted(bool m) { muted_ = m; }
     inline float input_gain() const { return input_gain_; }
     inline bool input_enabled() const { return input_enabled_; }
     inline bool output_enabled() const { return output_enabled_; }
@@ -52,6 +55,7 @@ protected:
     int input_channels_ = 1;
     int output_channels_ = 1;
     int output_volume_ = 70;
+    volatile bool muted_ = true;
     float input_gain_ = 0.0;
 
     virtual int Read(int16_t* dest, int samples) = 0;

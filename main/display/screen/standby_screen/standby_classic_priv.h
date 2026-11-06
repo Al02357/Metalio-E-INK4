@@ -56,6 +56,11 @@ struct WeatherSnap {
     char text[32] = {};
     char icon_code[8] = {};
     char lunar[24] = {};
+    char city[24] = {};        // 自建服务器按 IP 定位的城市
+    bool has_range = false;
+    int tmin = 0, tmax = 0;    // 今天最低/最高
+    char tomorrow[40] = {};    // 「晴 4~15°C」
+    long fetched_at = 0;       // 拉取时刻（time()），0 = 来自 NVS 旧数据
 };
 
 struct TodoItem {

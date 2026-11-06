@@ -68,7 +68,7 @@ void Bluetooth_handle_response_line(const std::string& raw_line) {
         return;
     }
 
-    ESP_LOGD(TAG, "RX: %s", line.c_str());
+    ESP_LOGI(TAG, "RX: %s", line.c_str());
 
     if (line.find("SET MODE 1") != std::string::npos) {
         Bluetooth_active_mode = BtMode::kMode1;
@@ -190,26 +190,26 @@ void Bluetooth_mode_cmd_task(void* param) {
         case BtMode::kMode1:
             Bluetooth_post_status(Lang::Strings::BT_SWITCH_MODE1);
             uart.sendString("AT+RX=2\r\n");
-            ESP_LOGD(TAG, "TX: AT+RX=2");
+            ESP_LOGI(TAG, "TX: AT+RX=2");
             vTaskDelay(pdMS_TO_TICKS(700));
             uart.sendString("AT+MODE=1\r\n");
-            ESP_LOGD(TAG, "TX: AT+MODE=1");
+            ESP_LOGI(TAG, "TX: AT+MODE=1");
             break;
         case BtMode::kMode2:
             Bluetooth_post_status(Lang::Strings::BT_SWITCH_MODE2);
             uart.sendString("AT+TX=1\r\n");
-            ESP_LOGD(TAG, "TX: AT+TX=1");
+            ESP_LOGI(TAG, "TX: AT+TX=1");
             vTaskDelay(pdMS_TO_TICKS(700));
             uart.sendString("AT+MODE=2\r\n");
-            ESP_LOGD(TAG, "TX: AT+MODE=2");
+            ESP_LOGI(TAG, "TX: AT+MODE=2");
             break;
         case BtMode::kMode3:
             Bluetooth_post_status(Lang::Strings::BT_SWITCH_MODE3);
             uart.sendString("AT+RX=1\r\n");
-            ESP_LOGD(TAG, "TX: AT+RX=1");
+            ESP_LOGI(TAG, "TX: AT+RX=1");
             vTaskDelay(pdMS_TO_TICKS(700));
             uart.sendString("AT+MODE=3\r\n");
-            ESP_LOGD(TAG, "TX: AT+MODE=3");
+            ESP_LOGI(TAG, "TX: AT+MODE=3");
             break;
         default:
             break;
@@ -251,10 +251,10 @@ void Bluetooth_call_mode_task(void* /*param*/) {
     SimpleUart& uart = SimpleUart::getInstance();
     Bluetooth_post_status(Lang::Strings::BT_SWITCH_CALL);
     uart.sendString("AT+PP=1\r\n");
-    ESP_LOGD(TAG, "TX: AT+PP=1");
+    ESP_LOGI(TAG, "TX: AT+PP=1");
     vTaskDelay(pdMS_TO_TICKS(200));
     uart.sendString("AT+BTSCO=1\r\n");
-    ESP_LOGD(TAG, "TX: AT+BTSCO=1");
+    ESP_LOGI(TAG, "TX: AT+BTSCO=1");
     vTaskDelete(nullptr);
 }
 
@@ -263,10 +263,10 @@ void Bluetooth_music_mode_task(void* /*param*/) {
     SimpleUart& uart = SimpleUart::getInstance();
     Bluetooth_post_status(Lang::Strings::BT_SWITCH_MUSIC);
     uart.sendString("AT+BTSCO=0\r\n");
-    ESP_LOGD(TAG, "TX: AT+BTSCO=0");
+    ESP_LOGI(TAG, "TX: AT+BTSCO=0");
     vTaskDelay(pdMS_TO_TICKS(200));
     uart.sendString("AT+PP=1\r\n");
-    ESP_LOGD(TAG, "TX: AT+PP=1");
+    ESP_LOGI(TAG, "TX: AT+PP=1");
     vTaskDelete(nullptr);
 }
 

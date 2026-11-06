@@ -1,5 +1,12 @@
 #include "lv_adapter_display.h"
+#include "shutdown_hint_bitmap.h"
+#include "clock_glyphs.h"
+#include <esp_private/esp_clk.h>
+#include "date_glyphs.h"
+#include <ctime>
+#include "display/screen/standby_screen/standby_card.h"
 
+#include <atomic>
 #include <cstdio>
 #include <cstring>
 #include <ctime>
@@ -26,6 +33,8 @@
 #include "power_policy.h"
 #include "esp_lv_adapter.h"
 #include "esp_lv_fs.h"
+#include "src/misc/lv_area_private.h"
+#include "src/core/lv_refr_private.h"
 #include "book_screen/reader/book_reader_prefs.h"
 #include "book_screen/settings/book_tap_zones.h"
 #include "display_orient.h"
@@ -33,11 +42,13 @@
 #include "epd_i1_glyph_thin.h"
 #include "haptic_feedback.h"
 #include "home_screen/home_screen.h"
+#include "quick_panel.h"
 #include "touch_missing_screen/touch_missing_screen.h"
 #include "mmap_generate_resources.h"
 #include <wifi_station.h>
 #include "a2ui_image.h"
 #include "sd_paths.h"
+#include "settings.h"
 #include "SdCardManager.hpp"
 #include "wallpaper_screen/wallpaper_active.h"
 #include "reader/book_home_snapshot.h"
@@ -108,7 +119,8 @@ bool TryLoadShutdownA2i1FromSd(uint8_t** out_buf, size_t* out_len) {
     }
 
     char path[192] = {};
-    if (!Wallpaper_TryResolveActiveWallpaperPath(path, sizeof(path))) {
+    if (!Wallpaper_TryResolveActiveWallpaperPath(path, sizeof(path)) &&
+        !StandbyCard_TryPath(path, sizeof(path))) {
         ESP_LOGD(TAG, "shutdown img: no NVS shutdown file → built-in");
         return false;
     }
@@ -192,6 +204,9 @@ TouchVkHoldState s_vk_hold{};
 #define LV_ADAPTER_TOUCH_TRACE 0
 #endif
 constexpr int kTouchFeedPeriodMs = 10;
+std::atomic<int> s_touch_period_ms{kTouchFeedPeriodMs};  // 蓝牙触控板时调短
+std::atomic<void (*)(bool, int, int)> s_touch_raw_hook{nullptr};
+std::atomic<bool> s_dbg_drag{false};  // 调试拖动期间真触摸不喂钩子
 constexpr UBaseType_t kTouchFeedPriority = 5; // > LVGL(1)
 constexpr uint8_t kTouchEdgeQueueDepth = 50; // LVGL 忙时 down/up 边沿积压上限
 struct TouchDownEdge {
@@ -211,6 +226,7 @@ struct TouchFeedSnapshot {
 };
 portMUX_TYPE s_touch_snap_mux = portMUX_INITIALIZER_UNLOCKED;
 TouchFeedSnapshot s_touch_snap{};
+int64_t s_touch_mark_us = 0;  // 最近一次触摸抬起（耗时打点：抬手 → 送屏）
 TaskHandle_t s_touch_feed_task = nullptr;
 volatile bool s_touch_feed_run = false;
 esp_lcd_touch_handle_t s_touch_tp = nullptr;
@@ -263,6 +279,7 @@ bool TouchFeedUiReleaseLocked() {
     if (s_touch_snap.live_count == 0) {
         return false;
     }
+    s_touch_mark_us = esp_timer_get_time();
     s_touch_snap.live_count = 0;
     if (s_touch_snap.pending_up < kTouchEdgeQueueDepth) {
         s_touch_snap.pending_up++;
@@ -303,12 +320,26 @@ void TouchFeedKickLvgl(const char* why, uint8_t pend_d, uint8_t pend_u, uint8_t 
     }
 }
 
+// 下拉快捷面板手势：从顶部状态栏（逻辑 y < kPullZoneY）按下，向下拖过 kPullDistance
+constexpr int kPullZoneY = 52;
+constexpr int kPullDistance = 90;
+bool s_pull_armed = false;   // 本次按下起点在状态栏
+bool s_pull_fired = false;   // 已触发打开；直到抬手前不再喂 LVGL
+int s_pull_start_y = 0;
+
 /** touch_feed：按下边沿早震；盖板键逻辑；屏内锁存 down/up 边沿供 LVGL 补齐 CLICKED。 */
 void TouchFeedHandleSample(uint8_t count, int x, int y) {
     if (BatteryUvLockout_IsActive()) {
         return;
     }
+    if (auto hook = s_dbg_drag.load() ? nullptr : s_touch_raw_hook.load()) {  // 原始触摸（逻辑坐标），给蓝牙触控板用，不经 LVGL 的 30ms 节拍
+        int ux = x, uy = y;
+        if (count > 0) DisplayUiTouchToLogical(x, y, &ux, &uy);
+        hook(count > 0, ux, uy);
+    }
     if (count == 0) {
+        s_pull_armed = false;
+        s_pull_fired = false;
         if (s_finger_was_down) {
             ESP_LOGD(TAG, "touch up");
         }
@@ -347,6 +378,9 @@ void TouchFeedHandleSample(uint8_t count, int x, int y) {
         }
         ESP_LOGD(TAG, "touch down x=%d y=%d %s", ui_x, ui_y,
                  early_hit != nullptr ? early_hit->name : "ui");
+        s_pull_armed = early_hit == nullptr && ui_y < kPullZoneY && !QuickPanel::IsOpen();
+        s_pull_fired = false;
+        s_pull_start_y = ui_y;
         if (early_hit != nullptr) {
             HapticBeginPress();
             // 可长按键：按下不震，短按 Click / 长按达成时再震（避免连震两下）
@@ -366,6 +400,24 @@ void TouchFeedHandleSample(uint8_t count, int x, int y) {
         int ui_x = x;
         int ui_y = y;
         DisplayUiTouchToLogical(x, y, &ui_x, &ui_y);
+        if (s_pull_fired) {
+            return;  // 面板已在打开：本次按住期间不再喂 LVGL
+        }
+        if (s_pull_armed && ui_y - s_pull_start_y >= kPullDistance) {
+            s_pull_fired = true;
+            s_pull_armed = false;
+            ESP_LOGI(TAG, "pull-down gesture -> quick panel");
+            // 结束这次 UI 按下，避免状态栏上的控件收到点击
+            bool kick_up = false;
+            portENTER_CRITICAL(&s_touch_snap_mux);
+            kick_up = TouchFeedUiReleaseLocked();
+            portEXIT_CRITICAL(&s_touch_snap_mux);
+            if (kick_up) {
+                TouchFeedKickLvgl("pull_up", 0, 0, 0, false, 0, 0);
+            }
+            QuickPanel::RequestOpen();
+            return;
+        }
         const uint16_t ux = static_cast<uint16_t>(ui_x);
         const uint16_t uy = static_cast<uint16_t>(ui_y);
         bool kick = false;
@@ -465,7 +517,32 @@ void TouchFeedTask(void* arg) {
         const int x = count > 0 ? static_cast<int>(pts[0].x) : 0;
         const int y = count > 0 ? static_cast<int>(pts[0].y) : 0;
         TouchFeedHandleSample(count, x, y);
-        vTaskDelay(pdMS_TO_TICKS(kTouchFeedPeriodMs));
+        const int per = s_touch_period_ms.load();
+        if (per >= 10) {
+            vTaskDelay(pdMS_TO_TICKS(per));
+        } else {
+            // 节拍 10ms，比它短的周期靠 esp_timer 叫醒（蓝牙触控板要 8ms ≈ 125Hz）
+            static esp_timer_handle_t s_tick = nullptr;
+            static int s_tick_per = 0;
+            if (!s_tick) {
+                esp_timer_create_args_t a = {};
+                a.callback = [](void*) {
+                    if (TaskHandle_t t = s_touch_feed_task) xTaskNotifyGive(t);
+                };
+                a.name = "touch_tick";
+                esp_timer_create(&a, &s_tick);
+            }
+            if (s_tick_per != per) {
+                esp_timer_stop(s_tick);
+                esp_timer_start_periodic(s_tick, static_cast<uint64_t>(per) * 1000);
+                s_tick_per = per;
+            }
+            ulTaskNotifyTake(pdTRUE, 2);
+            if (s_touch_period_ms.load() >= 10 && s_tick_per) {  // 退出快速模式就停掉定时器
+                esp_timer_stop(s_tick);
+                s_tick_per = 0;
+            }
+        }
     }
     s_touch_feed_task = nullptr;
     vTaskDelete(nullptr);
@@ -615,8 +692,16 @@ esp_err_t CustomTouchRead(esp_lcd_touch_handle_t tp, esp_lcd_touch_point_data_t*
  */
 static constexpr uint8_t kLvglWhite = 0xFF;
 static constexpr int kPartialDirtyPadPx = 24;
-/** 连续局刷达到该次数后，下一次改走全刷清残影 */
-static constexpr uint32_t kPartialsPerFull = 15;
+/** 连续局刷达到该次数后，下一次改走全刷清残影；0 = 不自动全刷（设置→屏幕可调，存 NVS） */
+static constexpr int kDefaultPartialsPerFull = 15;
+static std::atomic<int> s_partials_per_full{kDefaultPartialsPerFull};
+static constexpr const char* kEpdNvsNs = "epd";
+static constexpr const char* kEpdNvsFullEvery = "full_every";
+
+static uint32_t PartialsPerFull() {
+    const int n = s_partials_per_full.load(std::memory_order_relaxed);
+    return n <= 0 ? UINT32_MAX : static_cast<uint32_t>(n);
+}
 
 struct EpdFlushCtx {
     lv_display_t* disp = nullptr;
@@ -630,6 +715,8 @@ struct EpdFlushCtx {
     int panel_h = 0;
     bool has_last = false;
     uint32_t partial_refresh_count = 0;
+    uint32_t partial_weight_milli = 0;    // 局刷按变化面积折算的累计量，满 1000 记 1 次
+    int64_t last_partial_us = 0;          // 耗时打点：上次局刷开始时刻
     bool defer_boot_paint = true;  // SetupUI 完成前只攒帧不上屏
     bool boot_fb_ready = false;
     bool defer_standby_paint = false;     // 进待机 settle：只攒帧，Park 再全刷
@@ -645,6 +732,9 @@ struct EpdFlushCtx {
      */
     bool refresh_inflight = false;
     bool coalesce_pending = false; // BUSY 时合并脏帧，flush 立刻返回好让 indev 跑
+    volatile bool absorb_flush = false;  // 看图一次刷：LVGL 刷屏只进帧缓冲
+    volatile bool gray_hold = false;     // 看图保灰：状态栏的重画先攒着
+    int gray_hold_h = 0;
     bool coalesce_kick_armed = false; // 已挂 esp_timer 等待 BUSY 后补刷 coalesce
     esp_timer_handle_t coalesce_timer = nullptr;
 };
@@ -802,8 +892,119 @@ static void ExpandPartialDirty(EpdFlushCtx* ctx, int* x_draw, int* y_draw, int* 
     *h_draw = ch_y1 - ch_y0;
 }
 
+// ---------------------------------------------------------------- 按下即反色
+// 手指按下：被按的控件在送屏时整块反色，约 0.1 秒后局刷出来，让人马上知道点上了；
+// 松手：清掉反色并重画该区域，和点击引起的界面变化合成同一次刷新。
+// 反色只在送屏这一步做（逻辑→面板旋转之后），不改 LVGL 的画面，所以不用每个页面改样式。
+static lv_area_t s_inv_area;               // 逻辑坐标
+static volatile bool s_inv_on = false;
+static volatile bool s_press_flash = false;  // 下一次局刷是「按下反色」：用短波形，少占屏幕忙时
+// 短波形帧数；0 = 关（按下反色也用普通局刷）。
+// 短波形会让被按的那块只变成深灰，但芯片按「已经全黑」记账；下一屏这里要显示黑字时只补 4 帧，字发灰，看着像残影。
+static int s_press_tp0 = 0;
+static int s_norm_tp0 = 13, s_norm_tp1 = 4;
+static void PressInvApply(uint8_t* dst, int panel_w, int panel_h, int x, int y, int w, int h) {
+    if (!s_inv_on) return;
+    const int ix1 = std::max<int>(x, s_inv_area.x1), iy1 = std::max<int>(y, s_inv_area.y1);
+    const int ix2 = std::min<int>(x + w - 1, s_inv_area.x2), iy2 = std::min<int>(y + h - 1, s_inv_area.y2);
+    if (ix1 > ix2 || iy1 > iy2) return;
+    int pa = 0, pb = 0, pc = 0, pd = 0;
+    DisplayUiLogicalToPanel(ix1, iy1, &pa, &pb);
+    DisplayUiLogicalToPanel(ix2, iy2, &pc, &pd);
+    const int px1 = std::max(0, std::min(pa, pc)), px2 = std::min(panel_w - 1, std::max(pa, pc));
+    const int py1 = std::max(0, std::min(pb, pd)), py2 = std::min(panel_h - 1, std::max(pb, pd));
+    if (px1 > px2 || py1 > py2) return;
+    const int stride = panel_w / 8;
+    const int b1 = px1 >> 3, b2 = px2 >> 3;
+    const uint8_t m1 = static_cast<uint8_t>(0xFF >> (px1 & 7));
+    const uint8_t m2 = static_cast<uint8_t>(0xFF << (7 - (px2 & 7)));
+    for (int py = py1; py <= py2; ++py) {
+        uint8_t* row = dst + py * stride;
+        if (b1 == b2) {
+            row[b1] ^= static_cast<uint8_t>(m1 & m2);
+            continue;
+        }
+        row[b1] ^= m1;
+        for (int b = b1 + 1; b < b2; ++b) row[b] ^= 0xFF;
+        row[b2] ^= m2;
+    }
+}
+
+static int64_t s_overlay_us = 0;  // 本帧 OverlayDirty 累计耗时（打点）
+static int64_t s_flush_enter_us = 0;  // 本帧第一次进 flush 的时刻（打点）
+static void OverlayDirtyImpl(uint8_t* dst, const uint8_t* color_map, int panel_w, int panel_h, int x_draw,
+                             int y_draw, int w_draw, int h_draw);
 static void OverlayDirty(uint8_t* dst, const uint8_t* color_map, int panel_w, int panel_h, int x_draw,
                          int y_draw, int w_draw, int h_draw) {
+    const int64_t t0 = esp_timer_get_time();
+    if (s_flush_enter_us == 0) s_flush_enter_us = t0;
+    OverlayDirtyImpl(dst, color_map, panel_w, panel_h, x_draw, y_draw, w_draw, h_draw);
+    PressInvApply(dst, panel_w, panel_h, x_draw, y_draw, w_draw, h_draw);
+    s_overlay_us += esp_timer_get_time() - t0;
+}
+static void OverlayDirtySlow(uint8_t* dst, const uint8_t* color_map, int panel_w, int panel_h, int x_draw,
+                             int y_draw, int w_draw, int h_draw);
+
+/**
+ * 竖屏快速路径：逻辑 (lx,ly) → 面板 (px=ly, py=ph-1-lx)。按 8×8 位块转置，一次处理 64 像素。
+ * 原来逐像素调函数转坐标，整屏 38 万像素要 560ms（翻页、点按钮慢的主要原因），这里约 10ms。
+ */
+static void OverlayDirtyPortraitFast(uint8_t* dst, const uint8_t* color_map, int panel_w, int panel_h, int x_draw,
+                                     int y_draw, int w_draw, int h_draw) {
+    const int src_stride = (DisplayUiLogW() + 7) / 8;
+    const int dst_stride = panel_w / 8;
+    const int x_end = x_draw + w_draw, y_end = y_draw + h_draw;
+    const int ya = (y_draw + 7) & ~7, yb = y_end & ~7;  // 8 对齐的行段
+    const int xa = (x_draw + 7) & ~7, xb = x_end & ~7;
+    if (ya >= yb || xa >= xb) {
+        OverlayDirtySlow(dst, color_map, panel_w, panel_h, x_draw, y_draw, w_draw, h_draw);
+        return;
+    }
+    // 外层按逻辑列块（= 8 条面板行），内层沿逻辑行走：写面板是顺序的（PSRAM 缓存友好）
+    for (int lx0 = xa; lx0 < xb; lx0 += 8) {
+        uint8_t* drow[8];
+        for (int c = 0; c < 8; ++c) drow[c] = dst + (panel_h - 1 - (lx0 + c)) * dst_stride;
+        const uint8_t* scol = color_map + (lx0 >> 3);
+        for (int ly0 = ya; ly0 < yb; ly0 += 8) {
+            const uint8_t* sp = scol + ly0 * src_stride;
+            // 8×8 位矩阵转置（Hacker's Delight transpose8）
+            uint32_t x = (static_cast<uint32_t>(sp[0]) << 24) | (static_cast<uint32_t>(sp[src_stride]) << 16) |
+                         (static_cast<uint32_t>(sp[2 * src_stride]) << 8) | sp[3 * src_stride];
+            uint32_t y = (static_cast<uint32_t>(sp[4 * src_stride]) << 24) |
+                         (static_cast<uint32_t>(sp[5 * src_stride]) << 16) |
+                         (static_cast<uint32_t>(sp[6 * src_stride]) << 8) | sp[7 * src_stride];
+            uint32_t t = (x ^ (x >> 7)) & 0x00AA00AA; x = x ^ t ^ (t << 7);
+            t = (y ^ (y >> 7)) & 0x00AA00AA; y = y ^ t ^ (t << 7);
+            t = (x ^ (x >> 14)) & 0x0000CCCC; x = x ^ t ^ (t << 14);
+            t = (y ^ (y >> 14)) & 0x0000CCCC; y = y ^ t ^ (t << 14);
+            t = (x & 0xF0F0F0F0) | ((y >> 4) & 0x0F0F0F0F);
+            y = ((x << 4) & 0xF0F0F0F0) | (y & 0x0F0F0F0F);
+            x = t;
+            const int db = ly0 >> 3;
+            drow[0][db] = static_cast<uint8_t>(x >> 24); drow[1][db] = static_cast<uint8_t>(x >> 16);
+            drow[2][db] = static_cast<uint8_t>(x >> 8);  drow[3][db] = static_cast<uint8_t>(x);
+            drow[4][db] = static_cast<uint8_t>(y >> 24); drow[5][db] = static_cast<uint8_t>(y >> 16);
+            drow[6][db] = static_cast<uint8_t>(y >> 8);  drow[7][db] = static_cast<uint8_t>(y);
+        }
+    }
+    // 不对齐的边：逐像素
+    if (y_draw < ya) OverlayDirtySlow(dst, color_map, panel_w, panel_h, x_draw, y_draw, w_draw, ya - y_draw);
+    if (yb < y_end) OverlayDirtySlow(dst, color_map, panel_w, panel_h, x_draw, yb, w_draw, y_end - yb);
+    if (x_draw < xa) OverlayDirtySlow(dst, color_map, panel_w, panel_h, x_draw, ya, xa - x_draw, yb - ya);
+    if (xb < x_end) OverlayDirtySlow(dst, color_map, panel_w, panel_h, xb, ya, x_end - xb, yb - ya);
+}
+
+static void OverlayDirtyImpl(uint8_t* dst, const uint8_t* color_map, int panel_w, int panel_h, int x_draw,
+                             int y_draw, int w_draw, int h_draw) {
+    if (DisplayUiGetOrient() == kDisplayUiPortrait && DisplayUiLogW() == panel_h && (panel_w & 7) == 0) {
+        OverlayDirtyPortraitFast(dst, color_map, panel_w, panel_h, x_draw, y_draw, w_draw, h_draw);
+        return;
+    }
+    OverlayDirtySlow(dst, color_map, panel_w, panel_h, x_draw, y_draw, w_draw, h_draw);
+}
+
+static void OverlayDirtySlow(uint8_t* dst, const uint8_t* color_map, int panel_w, int panel_h, int x_draw,
+                             int y_draw, int w_draw, int h_draw) {
     const int log_w = DisplayUiLogW();
     const int src_stride = (log_w + 7) / 8;
     const int dst_stride = panel_w / 8;
@@ -837,6 +1038,73 @@ static void OverlayDirty(uint8_t* dst, const uint8_t* color_map, int panel_w, in
     }
 }
 
+static lv_display_t* s_press_disp = nullptr;
+static esp_lcd_panel_handle_t s_epd_panel = nullptr;
+static volatile bool* s_press_gray_hold = nullptr;  // 看图出灰期间不反色
+static lv_timer_t* s_press_timer = nullptr;
+static int64_t s_press_since_us = 0;
+
+static void PressInvClear() {
+    if (!s_inv_on) return;
+    s_inv_on = false;
+    if (s_press_disp) lv_inv_area(s_press_disp, &s_inv_area);
+    if (s_press_timer) lv_timer_pause(s_press_timer);
+}
+
+/** 拖动/滚动开始、松手漏报、按太久（5 秒）都收掉反色 */
+static void PressTimerCb(lv_timer_t* t) {
+    lv_indev_t* indev = static_cast<lv_indev_t*>(lv_timer_get_user_data(t));
+    if (!s_inv_on) {
+        lv_timer_pause(t);
+        return;
+    }
+    if (lv_indev_get_scroll_obj(indev) != nullptr || lv_indev_get_state(indev) == LV_INDEV_STATE_RELEASED ||
+        esp_timer_get_time() - s_press_since_us > 5000000) {
+        PressInvClear();
+    }
+}
+
+static void OnPressIndevEvent(lv_event_t* e) {
+    const lv_event_code_t code = lv_event_get_code(e);
+    if (code == LV_EVENT_RELEASED) {
+        PressInvClear();
+        return;
+    }
+    if (code != LV_EVENT_PRESSED || s_press_disp == nullptr) return;
+    if (s_press_gray_hold && *s_press_gray_hold) return;
+    lv_obj_t* o = static_cast<lv_obj_t*>(lv_event_get_param(e));
+    // 子控件没挂回调、事件冒泡给父控件的：反色父控件（比如书架格子里的封面图）
+    while (o && lv_obj_get_event_count(o) == 0 && lv_obj_has_flag(o, LV_OBJ_FLAG_EVENT_BUBBLE)) {
+        o = lv_obj_get_parent(o);
+    }
+    if (o == nullptr || lv_obj_get_parent(o) == nullptr || lv_obj_get_event_count(o) == 0) return;
+    if (lv_obj_has_flag(o, LV_OBJ_FLAG_USER_4)) return;  // 页面可用 USER_4 关掉反色
+    if (lv_obj_check_type(o, &lv_slider_class)) return;
+    lv_area_t a;
+    lv_obj_get_coords(o, &a);
+    // 被滚动容器裁掉的部分不反色
+    for (lv_obj_t* p = lv_obj_get_parent(o); p != nullptr; p = lv_obj_get_parent(p)) {
+        lv_area_t pa;
+        lv_obj_get_coords(p, &pa);
+        if (!lv_area_intersect(&a, &a, &pa)) return;
+    }
+    const int32_t w = lv_area_get_width(&a), h = lv_area_get_height(&a);
+    const int32_t scr = lv_display_get_horizontal_resolution(s_press_disp) *
+                        lv_display_get_vertical_resolution(s_press_disp);
+    if (w < 12 || h < 12 || w * h > scr * 35 / 100) return;  // 整屏点按区（阅读页、看图）不反色
+    if (s_inv_on) lv_inv_area(s_press_disp, &s_inv_area);
+    s_inv_area = a;
+    s_inv_on = true;
+    s_press_flash = true;
+    s_press_since_us = esp_timer_get_time();
+    lv_inv_area(s_press_disp, &a);
+    lv_refr_now(s_press_disp);  // 不等下一个刷新周期
+    if (s_press_timer == nullptr) {
+        s_press_timer = lv_timer_create(PressTimerCb, 50, lv_event_get_target(e));
+    }
+    lv_timer_resume(s_press_timer);
+}
+
 static esp_err_t WaitRefreshDone(EpdFlushCtx* ctx, const char* tag) {
     if (xSemaphoreTake(ctx->done_sem, pdMS_TO_TICKS(5000)) != pdTRUE) {
         ESP_LOGW(TAG, "%s timeout", tag);
@@ -849,7 +1117,6 @@ static esp_err_t WaitRefreshDone(EpdFlushCtx* ctx, const char* tag) {
 static esp_err_t DrawPartialDirty(EpdFlushCtx* ctx, esp_lcd_panel_handle_t panel, const uint8_t* prev_fb,
                                   const uint8_t* curr_fb, int x_draw, int y_draw, int w_draw,
                                   int h_draw) {
-    (void)prev_fb;
     (void)x_draw;
     (void)y_draw;
     (void)w_draw;
@@ -858,14 +1125,33 @@ static esp_err_t DrawPartialDirty(EpdFlushCtx* ctx, esp_lcd_panel_handle_t panel
         return ESP_ERR_INVALID_ARG;
     }
 
+    // 只有按下反色这一块在变：用短波形刷（变黑不用压到最黑，松手时普通局刷会恢复）
+    bool quick = false;
+    if (s_press_flash) {
+        s_press_flash = false;
+        const int inv = lv_area_get_width(&s_inv_area) * lv_area_get_height(&s_inv_area);
+        quick = s_press_tp0 > 0 && s_inv_on && w_draw * h_draw <= std::max(inv * 3, 160 * 160);  // 送屏区域会按 8/16 像素取整放大
+        if (quick) epaper_panel_set_partial_timing(panel, s_press_tp0, 0, 0);
+        ESP_LOGD(TAG, "press flash: dirty %dx%d inv=%d quick=%d", w_draw, h_draw, inv, quick ? 1 : 0);
+    }
     // curr_fb 在 PSRAM：draw_bitmap 内再拷到内部 DMA bounce，勿再经 tx_* 中转
     ESP_RETURN_ON_ERROR(epaper_panel_prepare_for_partial(panel), TAG, "partial prepare");
+    // 局刷按「旧图 0x26 vs 新图 0x24」决定每个像素怎么驱动。0xCF（刷完掉电）时芯片会自己把新图转成旧图；
+    // 保持上电（0xCC/0x0C）时不会，旧图停在更早的画面上，没变化的地方被当成「没变」不驱动，
+    // 上一屏弹过又收起的提示就会留在屏上。所以这时自己把上一帧写进 0x26（多 48KB，约 40ms）。
+    if (prev_fb != nullptr) {
+        epaper_panel_set_bitmap_color(panel, SSD1677_EPAPER_BITMAP_PREVIOUS);
+        ESP_RETURN_ON_ERROR(esp_lcd_panel_draw_bitmap(panel, 0, 0, ctx->panel_w, ctx->panel_h, prev_fb), TAG,
+                            "partial prev 0x26");
+    }
     epaper_panel_set_bitmap_color(panel, SSD1677_EPAPER_BITMAP_CURRENT);
     ESP_RETURN_ON_ERROR(
         esp_lcd_panel_draw_bitmap(panel, 0, 0, ctx->panel_w, ctx->panel_h, curr_fb), TAG,
         "partial curr 0x24");
     epaper_panel_set_refresh_mode(panel, SSD1677_EPAPER_REFRESH_PARTIAL);
-    return epaper_panel_refresh_screen(panel);
+    const esp_err_t err = epaper_panel_refresh_screen(panel);
+    if (quick) epaper_panel_set_partial_timing(panel, s_norm_tp0, s_norm_tp1, 0);  // 下一次局刷换回正常波形
+    return err;
 }
 
 /** 写 0x26=prev、0x24=curr（不激活）。 */
@@ -992,6 +1278,7 @@ static esp_err_t GrayRefreshFromWorkFb(EpdFlushCtx* ctx, const char* wait_tag, b
         ctx->partial_refresh_count++;
     } else {
         ctx->partial_refresh_count = 0;
+        ctx->partial_weight_milli = 0;
     }
     ESP_LOGD(TAG, "%s GRAY overlay+0xCC done (base=%s)", wait_tag, use_full_base ? "FULL" : "PARTIAL");
     return ESP_OK;
@@ -1003,8 +1290,11 @@ static bool WantReaderGrayAa(void) {
     return epd_i1_glyph_aa_enabled != 0;
 }
 
+static int64_t s_refr_start_us = 0;   // 这一帧 LVGL 开始渲染的时刻（耗时打点）
+
 static void OnLvglRefrStart(lv_event_t* e) {
     (void)e;
+    s_refr_start_us = esp_timer_get_time();
     if (WantReaderGrayAa()) {
         epd_gray_aa_begin_frame();
     }
@@ -1035,9 +1325,52 @@ static bool TryFinishInflightRefresh(EpdFlushCtx* ctx) {
 
 static void ArmCoalesceKick(EpdFlushCtx* ctx);
 
+/** 全刷计数按变化量折算：变化字节达到 1/4 屏记 1 次，状态栏图标/时钟这类小变化只记零头。 */
+static void AccountPartial(EpdFlushCtx* ctx, int w_draw, int h_draw) {
+    // 用真正变化的字节数（8 像素一组）而不是外接矩形：时钟+角标这种相距远的小变化外接框很大
+    size_t changed = 0;
+    {
+        const uint32_t* a = reinterpret_cast<const uint32_t*>(ctx->last_fb);
+        const uint32_t* b = reinterpret_cast<const uint32_t*>(ctx->work_fb);
+        const size_t n = ctx->fb_size / 4;
+        for (size_t i = 0; i < n; ++i) {
+            const uint32_t x = a[i] ^ b[i];
+            if (x == 0) continue;
+            changed += ((x & 0xFFu) != 0) + ((x & 0xFF00u) != 0) + ((x & 0xFF0000u) != 0) + ((x >> 24) != 0);
+        }
+    }
+    const size_t quarter = ctx->fb_size / 4;
+    uint32_t milli = quarter ? static_cast<uint32_t>(changed * 1000 / quarter) : 1000;
+    if (milli > 1000) milli = 1000;
+    if (milli < 10) milli = 10;
+    ctx->partial_weight_milli += milli;
+    ctx->partial_refresh_count += ctx->partial_weight_milli / 1000;
+    ctx->partial_weight_milli %= 1000;
+    const int64_t now = esp_timer_get_time();
+    const uint32_t every = PartialsPerFull();
+    {
+        const int render_ms = s_refr_start_us ? static_cast<int>((now - s_refr_start_us) / 1000) : -1;
+        const int touch_ms = s_touch_mark_us && now - s_touch_mark_us < 10000000
+                                 ? static_cast<int>((now - s_touch_mark_us) / 1000) : -1;
+        const int lv_ms = s_refr_start_us && s_flush_enter_us ? static_cast<int>((s_flush_enter_us - s_refr_start_us) / 1000) : -1;
+        ESP_LOGD(TAG, "epd timing: refr->send %dms (lvgl %dms, rotate %dms) touch->send %dms cpu=%dMHz", render_ms,
+                 lv_ms, static_cast<int>(s_overlay_us / 1000), touch_ms, static_cast<int>(esp_clk_cpu_freq() / 1000000));
+        s_refr_start_us = 0;
+        s_flush_enter_us = 0;
+        s_overlay_us = 0;
+    }
+    ESP_LOGI(TAG, "epd partial %dx%d chg=%uB w=%u -> %u.%03u/%u prev_busy=%ums prev22=%02X analog=%d gap=%dms", w_draw, h_draw,
+             (unsigned)changed, (unsigned)milli, (unsigned)ctx->partial_refresh_count, (unsigned)ctx->partial_weight_milli,
+             (unsigned)(every == UINT32_MAX ? 0 : every), (unsigned)epaper_panel_last_busy_ms(ctx->panel),
+             epaper_panel_last_ctrl2(ctx->panel), epaper_panel_analog_on(ctx->panel) ? 1 : 0,
+             ctx->last_partial_us ? (int)((now - ctx->last_partial_us) / 1000) : -1);
+    ctx->last_partial_us = now;
+}
+
 /** BUSY 结束后把 coalesce 的 work_fb 局刷上屏（无新 LVGL flush 时补一刀）。 */
 static void CommitCoalescedFrame(EpdFlushCtx* ctx) {
-    if (ctx == nullptr || !ctx->coalesce_pending || ctx->freeze_updates || ctx->defer_standby_paint) {
+    if (ctx == nullptr || !ctx->coalesce_pending || ctx->freeze_updates || ctx->defer_standby_paint ||
+        ctx->absorb_flush || ctx->gray_hold) {
         return;
     }
     if (!TryFinishInflightRefresh(ctx)) {
@@ -1048,7 +1381,19 @@ static void CommitCoalescedFrame(EpdFlushCtx* ctx) {
         ctx->coalesce_pending = false;
         return;
     }
+    if (ctx->force_next_full) {
+        // 「立即全刷」碰上屏幕正忙（比如快捷面板刚收起）：别在这里补局刷把它拖到下一次翻页，
+        // 让 LVGL 再出一帧，走正常 flush 里的全刷分支
+        if (lv_obj_t* scr = lv_screen_active()) lv_obj_invalidate(scr);
+        return;
+    }
 
+    int cx = 0, cy = 0, cw = ctx->panel_w, ch = ctx->panel_h;
+    ExpandPartialDirty(ctx, &cx, &cy, &cw, &ch);
+    if (cw <= 0 || ch <= 0) {
+        ctx->coalesce_pending = false;
+        return;
+    }
     ctx->suppress_lvgl_notify = true;
     xSemaphoreTake(ctx->done_sem, 0);
     const esp_err_t err =
@@ -1061,7 +1406,7 @@ static void CommitCoalescedFrame(EpdFlushCtx* ctx) {
     }
 
     ctx->refresh_inflight = true;
-    ctx->partial_refresh_count++;
+    AccountPartial(ctx, cw, ch);
     memcpy(ctx->last_fb, ctx->work_fb, ctx->fb_size);
     ctx->coalesce_pending = false;
     ESP_LOGD(TAG, "coalesce commit after busy");
@@ -1077,6 +1422,24 @@ static void CoalesceKickAsync(void* user_data) {
     CommitCoalescedFrame(ctx);
 }
 
+/** 局刷后面板保持上电（省每次上下电约 220ms）；空闲 2.5 秒再掉电，省电也不让面板长时间带高压 */
+static unsigned s_vcom_parks = 0;  // 调试：拉回 VCOM 的次数（DebugInfo 里看）
+static void PanelIdleOffCb(lv_timer_t* t) {
+    auto* ctx = static_cast<EpdFlushCtx*>(lv_timer_get_user_data(t));
+    if (ctx == nullptr || ctx->panel == nullptr || !epaper_panel_analog_on(ctx->panel)) return;
+    // 看图出灰期间不掉电：灰度那次用的 VCOM 不是 0，掉电那一下会把灰阶往白/灰推，整屏发脏（用户实测约 1 秒后变灰）
+    if (ctx->gray_hold) return;
+    if (!ctx->refresh_inflight || TryFinishInflightRefresh(ctx)) {
+        if (epaper_panel_park_vcom(ctx->panel) == ESP_OK) ++s_vcom_parks;  // 刷完就把 VCOM 拉回 0
+    }
+    if (esp_timer_get_time() - ctx->last_partial_us < 2500000) return;
+    if (ctx->coalesce_pending) return;
+    if (ctx->refresh_inflight && !TryFinishInflightRefresh(ctx)) return;
+    const int64_t t0 = esp_timer_get_time();
+    const esp_err_t err = epaper_panel_power_off_if_on(ctx->panel);
+    ESP_LOGI(TAG, "epd idle power off %s (%dms)", esp_err_to_name(err), static_cast<int>((esp_timer_get_time() - t0) / 1000));
+}
+
 static void CoalesceEspTimerCb(void* arg) {
     // 勿在 timer 任务里直接碰 panel/LVGL：投递到 LVGL 线程
     if (lv_async_call(CoalesceKickAsync, arg) != LV_RESULT_OK) {
@@ -1089,7 +1452,7 @@ static void CoalesceEspTimerCb(void* arg) {
 
 static void ArmCoalesceKick(EpdFlushCtx* ctx) {
     if (ctx == nullptr || ctx->coalesce_timer == nullptr || ctx->freeze_updates ||
-        ctx->defer_standby_paint) {
+        ctx->defer_standby_paint || ctx->absorb_flush || ctx->gray_hold) {
         return;
     }
     if (!ctx->coalesce_pending) {
@@ -1132,6 +1495,24 @@ void BlitA2i1ToPanelFb(uint8_t* dst_fb, int panel_w, int panel_h, const uint8_t*
     }
 }
 
+/** 关机提示条：叠在关机图顶部（逻辑坐标 x=16,y=16），坐标映射同 BlitA2i1ToPanelFb。 */
+void OverlayShutdownHint(uint8_t* dst_fb, int panel_w, int panel_h) {
+    constexpr int kX0 = 16, kY0 = 16;
+    const int dst_stride = panel_w / 8;
+    const int src_stride = kShutdownHintW / 8;
+    for (int y = 0; y < kShutdownHintH; y++) {
+        for (int x = 0; x < kShutdownHintW; x++) {
+            const int lx = kX0 + x, ly = kY0 + y;
+            const int px = ly, py = panel_h - 1 - lx;
+            if (px < 0 || py < 0 || px >= panel_w || py >= panel_h) continue;
+            const bool white = (kShutdownHintBits[y * src_stride + (x >> 3)] & (0x80 >> (x & 7))) != 0;
+            uint8_t* byte = &dst_fb[py * dst_stride + (px >> 3)];
+            const uint8_t mask = static_cast<uint8_t>(0x80 >> (px & 7));
+            if (white) *byte |= mask; else *byte = static_cast<uint8_t>(*byte & ~mask);
+        }
+    }
+}
+
 /** 关机：关机图一次全刷（0xC7，与进/出待机相同）。 */
 esp_err_t EpdShutdownFullFb(EpdFlushCtx* ctx, const uint8_t* curr_fb) {
     if (ctx == nullptr || ctx->panel == nullptr || ctx->last_fb == nullptr || curr_fb == nullptr ||
@@ -1153,6 +1534,29 @@ esp_err_t EpdShutdownFullFb(EpdFlushCtx* ctx, const uint8_t* curr_fb) {
     return err;
 }
 
+/**
+ * 看图保灰用的局刷波形：在 kEpdLutPartial 基础上，黑→黑那行不再加 VSH2 压黑（全 VSS），
+ * VCOM 用 0x30（和出灰那次一致；普通局刷是 0x00，会给所有像素一个推白的直流场）。只有真正变化的像素被驱动。
+ */
+static const uint8_t kEpdLutPartialHold[112] = {
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,  // 行0 黑→黑：VSS
+    0x80, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,  // 行1 黑→白：VSL
+    0x40, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,  // 行2 白→黑：VSH1
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,  // 行3 白→白：VSS
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,  // 行4 VCOM=DC
+    0x0D, 0x00, 0x00, 0x00, 0x00,                                // 组0 TPA=13 帧
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,  // 组1..9 全 0
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00,
+    0x22, 0x22, 0x22, 0x22, 0x22,
+    0x17, 0x41, 0xA8, 0x32, 0x30,
+    0x00, 0x00,
+};
+static volatile bool s_gray_hold_lut = true;  // false = 退回「状态栏攒着不刷」
+static bool GrayHoldLutOn() { return s_gray_hold_lut; }
+
 // GCC 在超大翻译单元内于 EpdLvglDrawBitmap 中展开 ESP_LOGI 可能 ICE，日志单独成函数
 void LogAaOffDualPlanePartialSeed() {
     ESP_LOGD(TAG, "aa_off dual-plane PARTIAL 0x26=old 0x24=new");
@@ -1170,6 +1574,65 @@ esp_err_t EpdLvglDrawBitmap(lv_display_t* disp, esp_lcd_panel_handle_t panel, in
         if (ctx->disp) {
             lv_display_flush_ready(ctx->disp);
         }
+        return ESP_OK;
+    }
+    if (ctx->gray_hold && !ctx->absorb_flush) {
+        // 先把这次重画合进 work_fb，再看状态栏以外有没有像素变化：没有就继续攒着不上屏
+        // （有时 LVGL 会整屏重画，但画出来的东西和屏上一样）
+        int ax = 0, ay = 0, aw = 0, ah = 0;
+        AlignArea(x_start, y_start, x_end, y_end, &ax, &ay, &aw, &ah);
+        if (aw > 0 && ah > 0) {
+            if (!ctx->coalesce_pending) memcpy(ctx->work_fb, ctx->last_fb, ctx->fb_size);
+            OverlayDirty(ctx->work_fb, static_cast<const uint8_t*>(color_map), ctx->panel_w, ctx->panel_h, ax, ay,
+                         aw, ah);
+            ctx->coalesce_pending = true;
+        }
+        // 竖屏逻辑 y = 面板 x：只比较面板每行里 x >= hold_h 的字节
+        const int stride = ctx->panel_w / 8;
+        const int b0 = (ctx->gray_hold_h + 7) / 8;
+        bool changed = false;
+        for (int py = 0; py < ctx->panel_h && !changed; ++py) {
+            changed = memcmp(ctx->work_fb + py * stride + b0, ctx->last_fb + py * stride + b0, stride - b0) != 0;
+        }
+        if (!changed) {
+            if (GrayHoldLutOn() && ctx->coalesce_pending && memcmp(ctx->work_fb, ctx->last_fb, ctx->fb_size) != 0) {
+                // 状态栏照常刷，但用「保持型」局刷波形：没变化的像素一律不驱动、VCOM 和出灰时一致，灰就不会漂
+                DrainRefreshIfNeeded(ctx);
+                ctx->suppress_lvgl_notify = true;
+                xSemaphoreTake(ctx->done_sem, 0);
+                esp_err_t err = epaper_panel_load_custom_lut(ctx->panel, kEpdLutPartialHold);
+                if (err == ESP_OK) {
+                    epaper_panel_set_bitmap_color(ctx->panel, SSD1677_EPAPER_BITMAP_CURRENT);
+                    err = esp_lcd_panel_draw_bitmap(ctx->panel, 0, 0, ctx->panel_w, ctx->panel_h, ctx->work_fb);
+                }
+                if (err == ESP_OK) {
+                    epaper_panel_set_refresh_mode(ctx->panel, SSD1677_EPAPER_REFRESH_CUSTOM);
+                    err = epaper_panel_refresh_screen(ctx->panel);
+                }
+                WriteBothPlanes(ctx, ctx->work_fb, ctx->work_fb, "gray_hold_partial");
+                xSemaphoreTake(ctx->done_sem, 0);
+                ctx->suppress_lvgl_notify = false;
+                memcpy(ctx->last_fb, ctx->work_fb, ctx->fb_size);
+                ctx->coalesce_pending = false;
+                ESP_LOGI(TAG, "gray hold partial (hold lut) busy=%ums -> %s",
+                         (unsigned)epaper_panel_last_busy_ms(ctx->panel), esp_err_to_name(err));
+            }
+            lv_display_flush_ready(ctx->disp);
+            return ESP_OK;
+        }
+        ctx->gray_hold = false;  // 有正经内容要画（换图、拉面板）：照常刷
+        ESP_LOGI(TAG, "gray hold off by area (%d,%d)-(%d,%d)", x_start, y_start, x_end, y_end);
+    }
+    if (ctx->absorb_flush) {
+        int ax = 0, ay = 0, aw = 0, ah = 0;
+        AlignArea(x_start, y_start, x_end, y_end, &ax, &ay, &aw, &ah);
+        if (aw > 0 && ah > 0) {
+            if (!ctx->coalesce_pending) memcpy(ctx->work_fb, ctx->last_fb, ctx->fb_size);
+            OverlayDirty(ctx->work_fb, static_cast<const uint8_t*>(color_map), ctx->panel_w, ctx->panel_h, ax, ay,
+                         aw, ah);
+            ctx->coalesce_pending = true;  // 先攒着；ApplyGray4Single 拿 work_fb 当新底
+        }
+        lv_display_flush_ready(ctx->disp);
         return ESP_OK;
     }
 
@@ -1255,6 +1718,7 @@ esp_err_t EpdLvglDrawBitmap(lv_display_t* disp, esp_lcd_panel_handle_t panel, in
         memcpy(ctx->last_fb, ctx->work_fb, ctx->fb_size);
         ctx->has_last = true;
         ctx->partial_refresh_count = 0;
+        ctx->partial_weight_milli = 0;
         ctx->coalesce_pending = false;
         ctx->coalesce_kick_armed = false;
         lv_display_flush_ready(ctx->disp);
@@ -1268,7 +1732,7 @@ esp_err_t EpdLvglDrawBitmap(lv_display_t* disp, esp_lcd_panel_handle_t panel, in
         ctx->force_dual_plane_partial = false;
         const bool force_full_base =
             !dual_seed &&
-            (ctx->force_next_full || ctx->partial_refresh_count >= kPartialsPerFull);
+            (ctx->force_next_full || ctx->partial_refresh_count >= PartialsPerFull());
         ctx->force_next_full = false;
         ctx->force_full_c7 = false;
         ctx->coalesce_pending = false;
@@ -1314,7 +1778,7 @@ esp_err_t EpdLvglDrawBitmap(lv_display_t* disp, esp_lcd_panel_handle_t panel, in
     }
 
     // 退待机后首帧 / 周期或其它强制全刷（FULL 与 STANDBY 均为 0xC7）
-    if (ctx->force_next_full || ctx->partial_refresh_count >= kPartialsPerFull) {
+    if (ctx->force_next_full || ctx->partial_refresh_count >= PartialsPerFull()) {
         const bool from_force = ctx->force_next_full;
         const bool use_c7 = from_force && ctx->force_full_c7;
         ctx->force_next_full = false;
@@ -1326,8 +1790,12 @@ esp_err_t EpdLvglDrawBitmap(lv_display_t* disp, esp_lcd_panel_handle_t panel, in
         const auto mode = use_c7 ? SSD1677_EPAPER_REFRESH_STANDBY : SSD1677_EPAPER_REFRESH_FULL;
         ESP_LOGD(TAG, "%s FULL 0x22=%02X", from_force ? "forced" : "periodic",
                  use_c7 ? SSD1677_PARAM_DISP_UPDATE_FULL_STANDBY : SSD1677_PARAM_DISP_UPDATE_FULL);
+        const int64_t t_full = esp_timer_get_time();
         esp_err_t err = FullRefreshBothSame(ctx, ctx->work_fb,
                                             from_force ? "forced_full" : "periodic_full", mode);
+        ESP_LOGI(TAG, "epd %s full: busy=%ums total=%dms", from_force ? "forced" : "periodic",
+                 (unsigned)epaper_panel_last_busy_ms(ctx->panel),
+                 (int)((esp_timer_get_time() - t_full) / 1000));
         ctx->suppress_lvgl_notify = false;
         ctx->refresh_inflight = false;
         if (err != ESP_OK) {
@@ -1336,18 +1804,25 @@ esp_err_t EpdLvglDrawBitmap(lv_display_t* disp, esp_lcd_panel_handle_t panel, in
         }
         memcpy(ctx->last_fb, ctx->work_fb, ctx->fb_size);
         ctx->partial_refresh_count = 0;
+        ctx->partial_weight_milli = 0;
         lv_display_flush_ready(ctx->disp);
         return ESP_OK;
     }
 
     const bool was_coalesce = ctx->coalesce_pending;
     if (was_coalesce) {
+        // 合并帧：发送仍走整帧；面积只用于全刷计数
         x_draw = 0;
         y_draw = 0;
         w_draw = ctx->panel_w;
         h_draw = ctx->panel_h;
+        ExpandPartialDirty(ctx, &x_draw, &y_draw, &w_draw, &h_draw);
         ctx->coalesce_pending = false;
         ctx->coalesce_kick_armed = false;
+        if (w_draw <= 0 || h_draw <= 0) {
+            lv_display_flush_ready(ctx->disp);
+            return ESP_OK;
+        }
     } else {
         // OverlayDirty 已写入面板 FB；脏矩形是逻辑坐标，XOR 须扫物理整帧
         x_draw = 0;
@@ -1377,7 +1852,7 @@ esp_err_t EpdLvglDrawBitmap(lv_display_t* disp, esp_lcd_panel_handle_t panel, in
     }
 
     ctx->refresh_inflight = true;
-    ctx->partial_refresh_count++;
+    AccountPartial(ctx, w_draw, h_draw);
 
     memcpy(ctx->last_fb, ctx->work_fb, ctx->fb_size);
     lv_display_flush_ready(ctx->disp);
@@ -1401,6 +1876,7 @@ void EpdCommitBootBaseline(EpdFlushCtx* ctx)
     if (err == ESP_OK) {
         ctx->has_last = true;
         ctx->partial_refresh_count = 0;
+        ctx->partial_weight_milli = 0;
     } else {
         ESP_LOGE(TAG, "boot paint: %s", esp_err_to_name(err));
     }
@@ -1414,6 +1890,11 @@ LVAdapterDisplay::LVAdapterDisplay(const esp_lcd_panel_handle_t panel,
                                    const esp_lcd_touch_handle_t touch_handle, const int width,
                                    const int height) {
     instance_ = this;
+    {
+        Settings st(kEpdNvsNs, false);
+        s_partials_per_full.store(st.GetInt(kEpdNvsFullEvery, kDefaultPartialsPerFull));
+        ESP_LOGI(TAG, "nvs load full_every=%d", s_partials_per_full.load());
+    }
     width_ = width;
     height_ = height;
     if (touch_handle != nullptr) {
@@ -1497,6 +1978,7 @@ LVAdapterDisplay::LVAdapterDisplay(const esp_lcd_panel_handle_t panel,
     lv_display_t* disp = esp_lv_adapter_register_display(&disp_cfg);
     ESP_ERROR_CHECK(disp ? ESP_OK : ESP_FAIL);
     epd_flush_ctx_->disp = disp;
+    s_epd_panel = panel;
     DisplayUiBind(disp, SSD1677_PANEL_WIDTH, SSD1677_PANEL_HEIGHT);
     DisplayUiSetOrient(kDisplayUiPortrait);
     lv_display_add_event_cb(disp, OnLvglRefrStart, LV_EVENT_REFR_START, nullptr);
@@ -1519,9 +2001,14 @@ LVAdapterDisplay::LVAdapterDisplay(const esp_lcd_panel_handle_t panel,
         touch_cfg.callbacks.custom_touch_read = CustomTouchRead;
         touch_indev_ = esp_lv_adapter_register_touch(&touch_cfg);
         ESP_ERROR_CHECK(touch_indev_ ? ESP_OK : ESP_FAIL);
+        s_press_disp = disp;
+        s_press_gray_hold = &epd_flush_ctx_->gray_hold;
+        lv_indev_add_event_cb(touch_indev_, OnPressIndevEvent, LV_EVENT_PRESSED, nullptr);
+        lv_indev_add_event_cb(touch_indev_, OnPressIndevEvent, LV_EVENT_RELEASED, nullptr);
         StartTouchFeed(touch_handle);
     }
 
+    lv_timer_create(PanelIdleOffCb, 100, epd_flush_ctx_);  // 100ms：刷完尽快拉回 VCOM
     ESP_ERROR_CHECK(esp_lv_adapter_start());
 
     const mmap_assets_config_t mmap_cfg = {
@@ -1787,6 +2274,52 @@ void LVAdapterDisplay::BeginStandbyEnterPaint() {
     ESP_LOGD(TAG, "standby enter: defer paint until FULL");
 }
 
+int LVAdapterDisplay::GetFullRefreshEvery() { return s_partials_per_full.load(); }
+
+void LVAdapterDisplay::SetFullRefreshEvery(int n) {
+    if (n < 0) n = 0;
+    if (n > 200) n = 200;
+    if (s_partials_per_full.exchange(n) == n) return;
+    ESP_LOGI(TAG, "full refresh every %d partials%s", n, n == 0 ? " (manual only)" : "");
+    // NVS 写会关 Flash cache：放到内部 RAM 栈的短任务里做，与 haptic 一致
+    xTaskCreate(
+        [](void*) {
+            Settings st(kEpdNvsNs, true);
+            st.SetInt(kEpdNvsFullEvery, s_partials_per_full.load());
+            vTaskDelete(nullptr);
+        },
+        "epd_nvs", 3072, nullptr, 5, nullptr);
+}
+
+void LVAdapterDisplay::RequestFullRefreshNow() {
+    // 须在 LVGL 线程调用：下一帧走全刷，并整屏失效触发一帧
+    auto* ctx = epd_flush_ctx_;
+    if (ctx == nullptr) return;
+    ctx->force_next_full = true;
+    if (lv_obj_t* scr = lv_screen_active()) {
+        lv_obj_invalidate(scr);
+    }
+}
+
+bool LVAdapterDisplay::CopyPanelFrame(std::vector<uint8_t>& out, int* w, int* h) {
+    DisplayLockGuard lock(this);
+    auto* ctx = epd_flush_ctx_;
+    if (ctx == nullptr || ctx->fb_size == 0) {
+        return false;
+    }
+    const uint8_t* fb = ctx->has_last ? ctx->last_fb : nullptr;
+    if (ctx->coalesce_pending && ctx->work_fb != nullptr) {
+        fb = ctx->work_fb;
+    }
+    if (fb == nullptr) {
+        return false;
+    }
+    out.assign(fb, fb + ctx->fb_size);
+    *w = ctx->panel_w;
+    *h = ctx->panel_h;
+    return true;
+}
+
 void LVAdapterDisplay::ParkEpdForStandby() {
     DisplayLockGuard lock(this);
     auto* ctx = epd_flush_ctx_;
@@ -1814,6 +2347,7 @@ void LVAdapterDisplay::ParkEpdForStandby() {
                 memcpy(ctx->last_fb, fb, ctx->fb_size);
             }
             ctx->partial_refresh_count = 0;
+        ctx->partial_weight_milli = 0;
             ctx->force_next_full = false;
             ctx->force_full_c7 = false;
         } else {
@@ -1876,6 +2410,524 @@ void LVAdapterDisplay::WakeEpdFromStandby() {
     ctx->force_next_full = true;
     ctx->force_full_c7 = true;
     ESP_LOGD(TAG, "standby: exit defer/freeze (next frame FULL 0xC7)");
+}
+
+namespace {
+/** 「11月3日  星期二  农历九月廿五」：本地算，不靠服务器那张卡（断网时卡上的日期会过期） */
+std::string LocalDateLine() {
+    const time_t now = time(nullptr);
+    struct tm t {};
+    if (now < 1700000000 || localtime_r(&now, &t) == nullptr) return "";
+    static const char* kWeek[] = {"日", "一", "二", "三", "四", "五", "六"};
+    char buf[96];
+    std::snprintf(buf, sizeof(buf), "%d月%d日  星期%s", t.tm_mon + 1, t.tm_mday, kWeek[t.tm_wday]);
+    std::string line = buf;
+    // 农历：查表（2025~2040）
+    struct tm base {};
+    base.tm_year = kLunarY0 - 1900;
+    base.tm_mon = 0;
+    base.tm_mday = 1;
+    base.tm_hour = 12;
+    struct tm today = t;
+    today.tm_hour = 12;
+    today.tm_min = today.tm_sec = 0;
+    const long di = static_cast<long>((mktime(&today) - mktime(&base)) / 86400);
+    if (di >= 0 && di < kLunarDays) {
+        static const char* kNum[] = {"", "一", "二", "三", "四", "五", "六", "七", "八", "九", "十"};
+        static const char* kMon[] = {"", "正", "二", "三", "四", "五", "六", "七", "八", "九", "十", "冬", "腊"};
+        const int m = kLunar[di * 2] & 0x7F, leap = kLunar[di * 2] & 0x80, d = kLunar[di * 2 + 1];
+        std::string ds;
+        if (d == 10) ds = "初十";
+        else if (d == 20) ds = "二十";
+        else if (d == 30) ds = "三十";
+        else ds = std::string(d < 10 ? "初" : (d < 20 ? "十" : (d < 30 ? "廿" : "卅"))) + kNum[d % 10];
+        if (m >= 1 && m <= 12) line += std::string("  农历") + (leap ? "闰" : "") + kMon[m] + "月" + ds;
+    }
+    return line;
+}
+
+const DateGlyph* FindDateGlyph(const char* p, int* len) {
+    for (const auto& g : kDateGlyphs) {
+        const int n = static_cast<int>(std::strlen(g.utf8));
+        if (std::strncmp(p, g.utf8, n) == 0) {
+            *len = n;
+            return &g;
+        }
+    }
+    *len = 1;
+    return nullptr;
+}
+}  // namespace
+
+int LVAdapterDisplay::StandbyDrawClock(int hh, int mm, int* err_out) {
+    DisplayLockGuard lock(this);
+    auto* ctx = epd_flush_ctx_;
+    if (ctx == nullptr || ctx->panel == nullptr || !ctx->standby_frozen || ctx->last_fb == nullptr ||
+        ctx->work_fb == nullptr) {
+        return 1;
+    }
+    // 逻辑坐标（竖屏 480×800）：顶部 0..120 是信息卡留给时钟的空白区
+    constexpr int kTop = 8, kBottom = 112;
+    const int idx[5] = {hh / 10 % 10, hh % 10, 10, mm / 10 % 10, mm % 10};
+    constexpr int kGap = 6;
+    int total = 0;
+    for (int i = 0; i < 5; ++i) total += kClockGlyphs[idx[i]].w + (i ? kGap : 0);
+    const int log_w = ctx->panel_h;  // 竖屏：逻辑宽 = 面板高
+    int x = (log_w - total) / 2;
+    const int y0 = (120 - kClockGlyphH) / 2;
+    const int pw = ctx->panel_w, ph = ctx->panel_h, stride = pw / 8;
+
+    memcpy(ctx->work_fb, ctx->last_fb, ctx->fb_size);
+    auto set_px = [&](int lx, int ly, bool black) {
+        const int px = ly, py = ph - 1 - lx;
+        if (px < 0 || py < 0 || px >= pw || py >= ph) return;
+        uint8_t* byte = &ctx->work_fb[py * stride + (px >> 3)];
+        const uint8_t mask = static_cast<uint8_t>(0x80 >> (px & 7));
+        if (black) *byte = static_cast<uint8_t>(*byte & ~mask); else *byte |= mask;
+    };
+    for (int ly = kTop; ly < kBottom; ++ly)
+        for (int lx = 0; lx < log_w; ++lx) set_px(lx, ly, false);
+    for (int i = 0; i < 5; ++i) {
+        const ClockGlyph& g = kClockGlyphs[idx[i]];
+        for (int gy = 0; gy < kClockGlyphH; ++gy)
+            for (int gx = 0; gx < g.w; ++gx)
+                if (g.bits[gy * g.stride + (gx >> 3)] & (0x80 >> (gx & 7))) set_px(x + gx, y0 + gy, true);
+        x += g.w + kGap;
+    }
+    // 日期行：盖掉卡片上服务器画的那行（逻辑 y 120..162，下面 164 是分隔线）
+    {
+        const std::string line = LocalDateLine();
+        if (!line.empty()) {
+            constexpr int kDateTop = 118, kDateBottom = 162;
+            int tw = 0;
+            for (const char* q = line.c_str(); *q;) {
+                int n = 1;
+                const DateGlyph* g = FindDateGlyph(q, &n);
+                tw += g ? g->w : 0;
+                q += n;
+            }
+            for (int ly = kDateTop; ly < kDateBottom; ++ly)
+                for (int lx = 0; lx < log_w; ++lx) set_px(lx, ly, false);
+            int dx = (log_w - tw) / 2;
+            const int dy = 120 + (40 - kDateGlyphH) / 2;
+            for (const char* q = line.c_str(); *q;) {
+                int n = 1;
+                const DateGlyph* g = FindDateGlyph(q, &n);
+                q += n;
+                if (!g) continue;
+                for (int gy = 0; gy < kDateGlyphH; ++gy)
+                    for (int gx = 0; gx < g->w; ++gx)
+                        if (g->bits[gy * g->stride + (gx >> 3)] & (0x80 >> (gx & 7))) set_px(dx + gx, dy + gy, true);
+                dx += g->w;
+            }
+        }
+    }
+    if (memcmp(ctx->work_fb, ctx->last_fb, ctx->fb_size) == 0) return 3;
+
+    ctx->suppress_lvgl_notify = true;
+    xSemaphoreTake(ctx->done_sem, 0);
+    const esp_err_t err = PartialBwBasePrevCurr(ctx, ctx->last_fb, ctx->work_fb, "standby_clock");
+    ctx->suppress_lvgl_notify = false;
+    if (err != ESP_OK) {
+        ESP_LOGW(TAG, "standby clock refresh: %s", esp_err_to_name(err));
+        if (err_out) *err_out = err;
+        return 2;
+    }
+    memcpy(ctx->last_fb, ctx->work_fb, ctx->fb_size);
+    ESP_LOGI(TAG, "standby clock %02d:%02d", hh, mm);
+    return 0;
+}
+
+// ---- 看图灰度波形（可调）
+namespace {
+int s_lut_ov[5] = {2, 5, 0, 0, 0x22};      // 叠加：深灰 / 浅灰 提亮帧数，fr
+int s_lut_full[5] = {40, 3, 16, 40, 0x44};  // 一次刷：清屏 / 浅灰 / 深灰 / 黑 加深帧数，fr（0x44 短帧≈半帧，浅灰 3 短帧=1.5 帧，用户实测）
+// 一次刷的浅灰「半帧」微调：组 2 只推浅灰那一行，用更快的帧率（0x44 每帧约 10ms，是 0x22 的一半）
+int s_lut_fine[2] = {0, 0x44};
+int s_ov_vcom = 0x30;  // 叠加那一遍的 VCOM（原来跟阅读灰 LUT 一样 0x30）
+// 刷底方案的叠加方式：0 = 黑底往白推（原方案，串扰明显）；1 = 白底往黑推（和一次刷第二段同一个方向）
+int s_ov_style = 1;  // 2.1.47 起默认白底加深（用户实测串扰轻）
+int s_ov_dark[3] = {6, 2, 0x44};  // 用户实测：深灰 6 / 浅灰 2 短帧
+int s_ov_black = 4;    // 白底加深时给纯黑像素补压的短帧数（行 1），把真灰 0 压得更黑
+int s_ov_vsh1 = 0x32;  // 白底加深这一遍的 VSH1（源极正压）；调低推得慢，深浅更好分档
+int s_clear_cycles = 1;                    // 一次刷清屏：黑→白 来回几次（0 = 不清，直接画，可能有残影）
+constexpr uint8_t kVSS = 0, kVSH1 = 1, kVSL = 2;
+
+void LutSetPhase(uint8_t* lut, int row, int group, int phase, uint8_t v) {
+    uint8_t& b = lut[row * 10 + group];
+    const int sh = 6 - 2 * phase;
+    b = static_cast<uint8_t>((b & ~(3 << sh)) | (v << sh));
+}
+void LutSetTp(uint8_t* lut, int group, int phase, int frames) {
+    lut[50 + group * 5 + phase] = static_cast<uint8_t>(frames < 0 ? 0 : (frames > 255 ? 255 : frames));
+}
+void LutTail(uint8_t* lut, int fr) {
+    for (int i = 0; i < 5; ++i) lut[100 + i] = static_cast<uint8_t>(fr);
+    // 电压同阅读灰 LUT：VGH / VSH1 / VSH2 / VSL / VCOM
+    lut[105] = 0x17; lut[106] = 0x41; lut[107] = 0xA8; lut[108] = 0x32; lut[109] = 0x30;
+}
+/** 叠加：底已是黑（灰像素画成黑），行 2 = 浅灰、行 3 = 深灰，VSL 往白推 */
+void BuildOverlayLut(uint8_t* lut) {
+    memset(lut, 0, 112);
+    if (s_ov_style == 1) {
+        // 白底：灰像素在底图里是白的；行 2 = 浅灰、行 3 = 深灰，VSH1 往黑推，深灰推得久
+        const int dk = s_ov_dark[0], lt = s_ov_dark[1];
+        LutSetPhase(lut, 2, 0, 0, kVSH1);
+        LutSetPhase(lut, 3, 0, 0, kVSH1);
+        LutSetTp(lut, 0, 0, lt < dk ? lt : dk);
+        if (dk > lt) {
+            LutSetPhase(lut, 3, 0, 1, kVSH1);
+            LutSetTp(lut, 0, 1, dk - lt);
+        }
+        if (s_ov_black > 0) {  // 组 1：纯黑再补压
+            LutSetPhase(lut, 1, 1, 0, kVSH1);
+            LutSetTp(lut, 1, 0, s_ov_black);
+        }
+        LutTail(lut, s_ov_dark[2]);
+        lut[106] = static_cast<uint8_t>(s_ov_vsh1);
+        lut[109] = static_cast<uint8_t>(s_ov_vcom);
+        return;
+    }
+    const int d = s_lut_ov[0], l = s_lut_ov[1];
+    LutSetPhase(lut, 2, 0, 0, kVSL);
+    LutSetPhase(lut, 3, 0, 0, kVSL);
+    LutSetTp(lut, 0, 0, d < l ? d : l);
+    if (l > d) {
+        LutSetPhase(lut, 2, 0, 1, kVSL);
+        LutSetTp(lut, 0, 1, l - d);
+    } else if (d > l) {
+        LutSetPhase(lut, 3, 0, 1, kVSL);
+        LutSetTp(lut, 0, 1, d - l);
+    }
+    LutTail(lut, s_lut_ov[4]);
+    lut[109] = static_cast<uint8_t>(s_ov_vcom);
+}
+/** 一次刷：行号 n = (0x26 位 << 1) | 0x24 位；0 白 1 浅灰 2 深灰 3 黑 */
+void BuildFullLut(uint8_t* lut) {
+    memset(lut, 0, 112);
+    const int c = s_lut_full[0], tl = s_lut_full[1], td = s_lut_full[2], tb = s_lut_full[3];
+    // 组 0：先黑后白清掉上一张的残影（s_clear_cycles 次）；0 次就只把全部推到白再画
+    for (int k = 0; k < 2; ++k) {
+        if (k >= s_clear_cycles && !(k == 0 && s_clear_cycles == 0)) break;
+        for (int r = 0; r < 4; ++r) {
+            if (s_clear_cycles > 0) LutSetPhase(lut, r, 0, k * 2, kVSH1);
+            LutSetPhase(lut, r, 0, k * 2 + 1, kVSL);
+        }
+        if (s_clear_cycles > 0) LutSetTp(lut, 0, k * 2, c);
+        LutSetTp(lut, 0, k * 2 + 1, c);
+    }
+    // 组 1：从白往黑推，越黑推越久
+    for (int r = 1; r < 4; ++r) LutSetPhase(lut, r, 1, 0, kVSH1);
+    LutSetTp(lut, 1, 0, tl);
+    for (int r = 2; r < 4; ++r) LutSetPhase(lut, r, 1, 1, kVSH1);
+    LutSetTp(lut, 1, 1, td - tl);
+    LutSetPhase(lut, 3, 1, 2, kVSH1);
+    LutSetTp(lut, 1, 2, tb - td);
+    (void)kVSS;
+    LutTail(lut, s_lut_full[4]);
+    if (s_lut_fine[0] > 0) {  // 组 2：浅灰再补几个短帧
+        LutSetPhase(lut, 1, 2, 0, kVSH1);
+        LutSetTp(lut, 2, 0, s_lut_fine[0]);
+        lut[101] = static_cast<uint8_t>(s_lut_fine[1]);  // 组 2/3 的帧率
+    }
+}
+inline void PanelBit(uint8_t* plane, int stride, int px, int py, bool on) {
+    uint8_t& b = plane[py * stride + (px >> 3)];
+    const uint8_t m = static_cast<uint8_t>(0x80 >> (px & 7));
+    b = on ? static_cast<uint8_t>(b | m) : static_cast<uint8_t>(b & ~m);
+}
+/**
+ * 灰像素在帧缓冲 / 面板 RAM 里记成白：局刷 LUT 对「黑→黑」会再压一下黑（灰会被慢慢压成黑），
+ * 对「白→白」不驱动，这样状态栏时钟之类的局刷不会把灰度吃掉。
+ */
+void WhitenGrayInFb(uint8_t* fb, int panel_w, int panel_h, const uint8_t* g2, int x0, int y0, int w, int h) {
+    const int stride = panel_w / 8, stride2 = (w + 3) / 4;
+    for (int y = 0; y < h; ++y) {
+        const uint8_t* row = g2 + static_cast<size_t>(y) * stride2;
+        for (int x = 0; x < w; ++x) {
+            const int v = (row[x >> 2] >> (6 - 2 * (x & 3))) & 3;
+            if (v != 1 && v != 2) continue;
+            int px = 0, py = 0;
+            DisplayUiLogicalToPanel(x0 + x, y0 + y, &px, &py);
+            if (px < 0 || py < 0 || px >= panel_w || py >= panel_h) continue;
+            PanelBit(fb, stride, px, py, true);
+        }
+    }
+}
+}  // namespace
+
+std::string LVAdapterDisplay::DebugInfo() {
+    DisplayLockGuard lock(this);
+    EpdFlushCtx* c = epd_flush_ctx_;
+    if (c == nullptr) return "no epd ctx";
+    char buf[256];
+    std::snprintf(buf, sizeof(buf),
+                  "vpark=%u "
+                  "partials=%u.%03u/%u last_busy=%ums since_last_partial=%dms inflight=%d coalesce=%d gray_hold=%d "
+                  "orient=%d press_inv=%d analog=%d last22=%02X",
+                  s_vcom_parks, (unsigned)c->partial_refresh_count, (unsigned)c->partial_weight_milli,
+                  (unsigned)(PartialsPerFull() == UINT32_MAX ? 0 : PartialsPerFull()),
+                  (unsigned)epaper_panel_last_busy_ms(c->panel),
+                  c->last_partial_us ? (int)((esp_timer_get_time() - c->last_partial_us) / 1000) : -1,
+                  c->refresh_inflight ? 1 : 0, c->coalesce_pending ? 1 : 0, c->gray_hold ? 1 : 0,
+                  DisplayUiGetOrient(), s_inv_on ? 1 : 0, epaper_panel_analog_on(c->panel) ? 1 : 0,
+                  epaper_panel_last_ctrl2(c->panel));
+    return buf;
+}
+
+void LVAdapterDisplay::DebugTap(int x, int y, int hold_ms) {
+    struct Arg { int x, y, ms; };
+    auto* arg = new Arg{x, y, hold_ms};
+    xTaskCreate([](void* p) {
+        auto* a = static_cast<Arg*>(p);
+        s_touch_mark_us = esp_timer_get_time();
+        PowerPolicy::GetInstance().NotifyUserActivity();
+        portENTER_CRITICAL(&s_touch_snap_mux);
+        s_touch_snap.suppress_lvgl = false;
+        TouchFeedUiPressLocked(static_cast<uint16_t>(a->x), static_cast<uint16_t>(a->y));
+        portEXIT_CRITICAL(&s_touch_snap_mux);
+        TouchFeedKickLvgl("dbg_down", 0, 0, 1, false, a->x, a->y);
+        s_dbg_drag.store(true);  // 模拟按住期间，真触摸（没按 = 抬起）别喂钩子
+        if (auto hook = s_touch_raw_hook.load()) hook(true, a->x, a->y);
+        vTaskDelay(pdMS_TO_TICKS(a->ms));
+        if (auto hook = s_touch_raw_hook.load()) hook(false, a->x, a->y);
+        s_dbg_drag.store(false);
+        portENTER_CRITICAL(&s_touch_snap_mux);
+        TouchFeedUiReleaseLocked();
+        portEXIT_CRITICAL(&s_touch_snap_mux);
+        TouchFeedKickLvgl("dbg_up", 0, 0, 0, true, a->x, a->y);
+        delete a;
+        vTaskDelete(nullptr);
+    }, "dbg_tap", 3072, arg, 5, nullptr);
+}
+
+void LVAdapterDisplay::SetGrayLut(int which, int a, int b, int c, int d, int fr) {
+    if (which == 4) {  // 普通局刷：a=组0帧数 b=组1帧数 c=帧率字节（<=0 不改）
+        if (a > 0) s_norm_tp0 = a;
+        if (b >= 0) s_norm_tp1 = b;
+        epaper_panel_set_partial_timing(s_epd_panel, a, b, c);
+        return;
+    }
+    if (which == 9) {  // 白底加深：纯黑补压短帧数
+        s_ov_black = a < 0 ? 0 : a;
+        ESP_LOGW(TAG, "overlay black push = %d", s_ov_black);
+        return;
+    }
+    if (which == 8) {  // 刷底叠加方式：a=0 黑底提亮 / 1 白底加深；b,c = 白底加深的深灰/浅灰帧数；d = 帧率
+        s_ov_style = a;
+        if (b > 0) s_ov_dark[0] = b;
+        if (c > 0) s_ov_dark[1] = c;
+        if (d > 0) s_ov_dark[2] = d;
+        if (fr > 0) s_ov_vsh1 = fr;
+        ESP_LOGW(TAG, "overlay style=%d dark=%d light=%d fr=0x%02X vsh1=0x%02X", s_ov_style, s_ov_dark[0], s_ov_dark[1],
+                 s_ov_dark[2], s_ov_vsh1);
+        return;
+    }
+    if (which == 7) {  // 叠加那一遍的 VCOM
+        s_ov_vcom = a & 0xFF;
+        ESP_LOGW(TAG, "overlay vcom = 0x%02X", s_ov_vcom);
+        return;
+    }
+    if (which == 6) {  // 一次刷浅灰微调：a=短帧数 b=帧率字节
+        s_lut_fine[0] = a < 0 ? 0 : a;
+        if (b > 0) s_lut_fine[1] = b;
+        ESP_LOGW(TAG, "gray fine = %d fr=0x%02X", s_lut_fine[0], s_lut_fine[1]);
+        return;
+    }
+    if (which == 5) {  // 按下反色的短波形帧数
+        s_press_tp0 = a < 0 ? 0 : a;
+        ESP_LOGW(TAG, "press flash tp0=%d", s_press_tp0);
+        return;
+    }
+    if (which == 3) {  // 看图保灰：1 = 保持型局刷波形照常刷状态栏，0 = 状态栏攒着不刷
+        s_gray_hold_lut = a != 0;
+        ESP_LOGW(TAG, "gray hold lut = %d", a);
+        return;
+    }
+    if (which == 2) {  // 清屏次数
+        s_clear_cycles = a < 0 ? 0 : (a > 2 ? 2 : a);
+        ESP_LOGW(TAG, "gray clear cycles = %d", s_clear_cycles);
+        return;
+    }
+    int* t = which == 0 ? s_lut_ov : s_lut_full;
+    t[0] = a; t[1] = b; t[2] = c; t[3] = d;
+    if (fr > 0) t[4] = fr;
+    ESP_LOGW(TAG, "gray lut %d = %d %d %d %d fr=0x%02X", which, t[0], t[1], t[2], t[3], t[4]);
+}
+
+bool LVAdapterDisplay::GrayOverlayFromWhite() { return s_ov_style == 1; }
+
+void LVAdapterDisplay::DebugRawDrag(int x0, int y0, int x1, int y1, int ms) {
+    struct Arg { int x0, y0, x1, y1, ms; };
+    auto* arg = new Arg{x0, y0, x1, y1, ms};
+    xTaskCreate([](void* p) {
+        auto* a = static_cast<Arg*>(p);
+        s_dbg_drag.store(true);
+        const int n = a->ms / 10 > 1 ? a->ms / 10 : 2;
+        for (int i = 0; i <= n; ++i) {
+            if (auto hook = s_touch_raw_hook.load()) hook(true, a->x0 + (a->x1 - a->x0) * i / n, a->y0 + (a->y1 - a->y0) * i / n);
+            vTaskDelay(1);
+        }
+        if (auto hook = s_touch_raw_hook.load()) hook(false, a->x1, a->y1);
+        s_dbg_drag.store(false);
+        delete a;
+        vTaskDelete(nullptr);
+    }, "dbg_drag", 3072, arg, 5, nullptr);
+}
+
+void LVAdapterDisplay::SetTouchRawHook(void (*hook)(bool down, int x, int y), int period_ms) {
+    s_touch_raw_hook.store(hook);
+    s_touch_period_ms.store(period_ms > 0 ? period_ms : kTouchFeedPeriodMs);
+}
+
+void LVAdapterDisplay::GetGrayLut(int which, int out[5]) {
+    const int* t = which == 0 ? s_lut_ov : s_lut_full;
+    for (int i = 0; i < 5; ++i) out[i] = t[i];
+}
+
+void LVAdapterDisplay::SetGrayHold(bool on, int top_h) {
+    DisplayLockGuard lock(this);
+    if (epd_flush_ctx_ == nullptr) return;
+    ESP_LOGI(TAG, "gray hold %d h=%d", on ? 1 : 0, top_h);
+    epd_flush_ctx_->gray_hold_h = top_h;
+    epd_flush_ctx_->gray_hold = on;
+}
+
+void LVAdapterDisplay::SetAbsorbFlush(bool on) {
+    DisplayLockGuard lock(this);
+    if (epd_flush_ctx_) epd_flush_ctx_->absorb_flush = on;
+}
+
+int LVAdapterDisplay::ApplyGray4Single(const uint8_t* g2, int x0, int y0, int w, int h, int timeout_ms) {
+    if (g2 == nullptr || w <= 0 || h <= 0) return 1;
+    (void)timeout_ms;
+    DisplayLockGuard lock(this);
+    auto* ctx = epd_flush_ctx_;
+    if (ctx == nullptr || ctx->panel == nullptr || ctx->gray_scratch == nullptr || ctx->freeze_updates) return 2;
+    DrainRefreshIfNeeded(ctx);
+    ctx->absorb_flush = false;
+    if (!ctx->coalesce_pending) memcpy(ctx->work_fb, ctx->last_fb, ctx->fb_size);
+    ctx->coalesce_pending = false;
+    ctx->coalesce_kick_armed = false;
+    const int stride = ctx->panel_w / 8;
+    const int stride2 = (w + 3) / 4;
+    // 两个平面：底图外的像素按帧缓冲（黑→3 白→0），图内按灰度（g2 0 黑..3 白 → n = 3 - v）
+    uint8_t* planes[2] = {ctx->gray_scratch, ctx->last_fb};  // last_fb 临时借来当第二平面，最后用 work_fb 恢复
+    for (int pl = 0; pl < 2; ++pl) {
+        uint8_t* out = planes[pl];
+        for (size_t i = 0; i < ctx->fb_size; ++i) out[i] = static_cast<uint8_t>(~ctx->work_fb[i]);
+        for (int y = 0; y < h; ++y) {
+            const uint8_t* row = g2 + static_cast<size_t>(y) * stride2;
+            for (int x = 0; x < w; ++x) {
+                const int v = (row[x >> 2] >> (6 - 2 * (x & 3))) & 3;
+                const int n = 3 - v;
+                int px = 0, py = 0;
+                DisplayUiLogicalToPanel(x0 + x, y0 + y, &px, &py);
+                if (px < 0 || py < 0 || px >= ctx->panel_w || py >= ctx->panel_h) continue;
+                PanelBit(out, stride, px, py, pl == 0 ? (n & 1) : (n >> 1));
+            }
+        }
+    }
+    static uint8_t lut[112];
+    BuildFullLut(lut);
+    ctx->suppress_lvgl_notify = true;
+    xSemaphoreTake(ctx->done_sem, 0);
+    const int64_t t0 = esp_timer_get_time();
+    esp_err_t err = epaper_panel_load_custom_lut(ctx->panel, lut);
+    if (err == ESP_OK) {
+        epaper_panel_set_bitmap_color(ctx->panel, SSD1677_EPAPER_BITMAP_CURRENT);
+        err = esp_lcd_panel_draw_bitmap(ctx->panel, 0, 0, ctx->panel_w, ctx->panel_h, ctx->gray_scratch);
+    }
+    if (err == ESP_OK) {
+        epaper_panel_set_bitmap_color(ctx->panel, SSD1677_EPAPER_BITMAP_PREVIOUS);
+        err = esp_lcd_panel_draw_bitmap(ctx->panel, 0, 0, ctx->panel_w, ctx->panel_h, ctx->last_fb);
+    }
+    if (err == ESP_OK) {
+        epaper_panel_set_refresh_mode(ctx->panel, SSD1677_EPAPER_REFRESH_CUSTOM);
+        err = epaper_panel_refresh_screen(ctx->panel);
+    }
+    const unsigned busy = epaper_panel_last_busy_ms(ctx->panel);
+    // 面板 RAM 和帧缓冲都回到黑白底（灰像素当黑），之后局刷照常
+    WhitenGrayInFb(ctx->work_fb, ctx->panel_w, ctx->panel_h, g2, x0, y0, w, h);
+    memcpy(ctx->last_fb, ctx->work_fb, ctx->fb_size);
+    WriteBothPlanes(ctx, ctx->work_fb, ctx->work_fb, "gray4_single");
+    xSemaphoreTake(ctx->done_sem, 0);
+    ctx->suppress_lvgl_notify = false;
+    ctx->has_last = true;
+    ctx->partial_refresh_count = 0;
+    ctx->partial_weight_milli = 0;
+    ctx->last_partial_us = esp_timer_get_time();  // 出灰后别马上被空闲掉电
+    ESP_LOGI(TAG, "gray4 single %dx%d busy=%ums total=%dms -> %s", w, h, busy,
+             static_cast<int>((esp_timer_get_time() - t0) / 1000), esp_err_to_name(err));
+    return err == ESP_OK ? 0 : 3;
+}
+
+int LVAdapterDisplay::ApplyGray4Overlay(const uint8_t* g2, int x0, int y0, int w, int h, int timeout_ms) {
+    if (g2 == nullptr || w <= 0 || h <= 0) return 1;
+    const int64_t deadline = esp_timer_get_time() + static_cast<int64_t>(timeout_ms) * 1000;
+    for (;;) {
+        {
+            DisplayLockGuard lock(this);
+            auto* ctx = epd_flush_ctx_;
+            if (ctx == nullptr || ctx->panel == nullptr || ctx->gray_scratch == nullptr || ctx->freeze_updates) return 2;
+            DrainRefreshIfNeeded(ctx);
+            if (!ctx->coalesce_pending && !ctx->defer_standby_paint && ctx->has_last) {
+                // 底图已上屏：work_fb = 屏上的黑白底，灰步收尾会用它把面板 RAM 写回 BW
+                memcpy(ctx->work_fb, ctx->last_fb, ctx->fb_size);
+                epd_gray_aa_clear();
+                const int stride = (w + 3) / 4;
+                int ngray = 0;
+                for (int y = 0; y < h; ++y) {
+                    const uint8_t* row = g2 + static_cast<size_t>(y) * stride;
+                    for (int x = 0; x < w; ++x) {
+                        const int v = (row[x >> 2] >> (6 - 2 * (x & 3))) & 3;
+                        if (v == 1 || v == 2) {
+                            epd_gray_aa_set_logical(x0 + x, y0 + y, v == 1 ? 170 : 85);
+                            ++ngray;
+                        } else if (v == 0 && s_ov_style == 1 && s_ov_black > 0) {
+                            epd_gray_aa_set_logical(x0 + x, y0 + y, 255);  // 纯黑补压（只进 LSB 平面）
+                        }
+                    }
+                }
+                ctx->suppress_lvgl_notify = true;
+                xSemaphoreTake(ctx->done_sem, 0);
+                esp_err_t err;
+                if (s_lut_ov[0] == 0 && s_lut_ov[1] == 0) {
+                    err = GrayOverlayAfterBwBase(ctx, "gray4_img");  // 阅读器原表
+                } else {
+                    static uint8_t lut[112];
+                    BuildOverlayLut(lut);
+                    err = epaper_panel_load_custom_lut(ctx->panel, lut);
+                    if (err == ESP_OK) {
+                        epd_gray_aa_pack_overlay_plane_ex(ctx->gray_scratch, 0, s_ov_style == 1 && s_ov_black > 0);
+                        epaper_panel_set_bitmap_color(ctx->panel, SSD1677_EPAPER_BITMAP_CURRENT);
+                        err = esp_lcd_panel_draw_bitmap(ctx->panel, 0, 0, ctx->panel_w, ctx->panel_h, ctx->gray_scratch);
+                    }
+                    if (err == ESP_OK) {
+                        epd_gray_aa_pack_overlay_plane(ctx->gray_scratch, 1);
+                        epaper_panel_set_bitmap_color(ctx->panel, SSD1677_EPAPER_BITMAP_PREVIOUS);
+                        err = esp_lcd_panel_draw_bitmap(ctx->panel, 0, 0, ctx->panel_w, ctx->panel_h, ctx->gray_scratch);
+                    }
+                    if (err == ESP_OK) {
+                        epaper_panel_set_refresh_mode(ctx->panel, SSD1677_EPAPER_REFRESH_CUSTOM);
+                        err = epaper_panel_refresh_screen(ctx->panel);
+                    }
+                    WriteBothPlanes(ctx, ctx->work_fb, ctx->work_fb, "gray4_img");
+                }
+                WhitenGrayInFb(ctx->work_fb, ctx->panel_w, ctx->panel_h, g2, x0, y0, w, h);
+                memcpy(ctx->last_fb, ctx->work_fb, ctx->fb_size);
+                WriteBothPlanes(ctx, ctx->work_fb, ctx->work_fb, "gray4_img_fix");
+                xSemaphoreTake(ctx->done_sem, 0);
+                ctx->suppress_lvgl_notify = false;
+                epd_gray_aa_clear();
+                ctx->last_partial_us = esp_timer_get_time();  // 出灰后别马上被空闲掉电
+                ESP_LOGI(TAG, "gray4 overlay %dx%d gray=%d -> %s", w, h, ngray, esp_err_to_name(err));
+                return err == ESP_OK ? 0 : 3;
+            }
+        }
+        if (esp_timer_get_time() > deadline) return 4;
+        vTaskDelay(pdMS_TO_TICKS(50));
+    }
 }
 
 void LVAdapterDisplay::RequestNextFullRefresh() {
@@ -1942,6 +2994,7 @@ void LVAdapterDisplay::ShowPoweredOffScreen() {
             }
             BlitA2i1ToPanelFb(epd_flush_ctx_->work_fb, epd_flush_ctx_->panel_w,
                               epd_flush_ctx_->panel_h, payload, w, h, stride);
+            OverlayShutdownHint(epd_flush_ctx_->work_fb, epd_flush_ctx_->panel_w, epd_flush_ctx_->panel_h);
             const esp_err_t err = EpdShutdownFullFb(epd_flush_ctx_, epd_flush_ctx_->work_fb);
             if (err != ESP_OK) {
                 ESP_LOGE(TAG, "shutdown full refresh failed: %s", esp_err_to_name(err));
@@ -2086,6 +3139,7 @@ void LVAdapterDisplay::ShowLowBatteryShutdownScreen() {
             }
             ctx->has_last = true;
             ctx->partial_refresh_count = 0;
+        ctx->partial_weight_milli = 0;
             ctx->coalesce_pending = false;
         } else {
             ESP_LOGW(TAG, "low-batt warn FULL: %s", esp_err_to_name(err));

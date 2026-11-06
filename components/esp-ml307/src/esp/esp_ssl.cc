@@ -1,5 +1,7 @@
+#include "esp_network.h"
 #include "esp_ssl.h"
 #include <esp_log.h>
+#include <esp_netif.h>
 #include <esp_crt_bundle.h>
 #include <cstring>
 #include <unistd.h>
@@ -7,10 +9,12 @@
 static const char *TAG = "EspSsl";
 
 EspSsl::EspSsl() {
+    EspNetwork_SocketCreated();
     event_group_ = xEventGroupCreate();
 }
 
 EspSsl::~EspSsl() {
+    EspNetwork_SocketDestroyed();
     Disconnect();
 
     if (event_group_ != nullptr) {
@@ -20,6 +24,11 @@ EspSsl::~EspSsl() {
 }
 
 bool EspSsl::Connect(const std::string& host, int port) {
+    // 离线模式开机时 WiFi/lwip 从没起过：此时调 DNS/socket 会 assert(Invalid mbox) 重启
+    if (EspNetwork_Blocked() || esp_netif_get_default_netif() == nullptr) {
+        ESP_LOGW(TAG, "network stack not started, skip connect %s", host.c_str());
+        return false;
+    }
     if (tls_client_ != nullptr) {
         ESP_LOGE(TAG, "tls client has been initialized");
         return false;

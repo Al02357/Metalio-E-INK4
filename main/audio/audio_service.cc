@@ -60,6 +60,13 @@ void AudioService::Initialize(AudioCodec* codec) {
 #endif
 
     audio_processor_->OnOutput([this](std::vector<int16_t>&& data) {
+        {
+            std::lock_guard<std::mutex> lock(pcm_sink_mutex_);
+            if (pcm_sink_) {
+                pcm_sink_(std::move(data));
+                return;
+            }
+        }
         PushTaskToEncodeQueue(kAudioTaskTypeEncodeToSendQueue, std::move(data));
     });
 
@@ -757,6 +764,62 @@ void AudioService::PlaySound(const std::string_view& ogg) {
 bool AudioService::IsIdle() {
     std::lock_guard<std::mutex> lock(audio_queue_mutex_);
     return audio_encode_queue_.empty() && audio_decode_queue_.empty() && audio_playback_queue_.empty() && audio_testing_queue_.empty();
+}
+
+void AudioService::SetPcmCaptureSink(PcmSink sink) {
+    std::lock_guard<std::mutex> lock(pcm_sink_mutex_);
+    pcm_sink_ = std::move(sink);
+}
+
+bool AudioService::PushPcmToPlayback(std::vector<int16_t>&& pcm, int sample_rate,
+                                     const std::atomic<bool>* cancel) {
+    if (codec_ == nullptr || service_stopped_ || pcm.empty()) {
+        return false;
+    }
+    const int out_rate = codec_->output_sample_rate();
+    if (sample_rate != out_rate) {
+        // 同一路流内采样率不变；仅在变化时重配，保持 silk 状态连续
+        if (pcm_playback_rate_ != sample_rate) {
+            pcm_playback_resampler_.Configure(sample_rate, out_rate);
+            pcm_playback_rate_ = sample_rate;
+        }
+        std::vector<int16_t> resampled(pcm_playback_resampler_.GetOutputSamples(pcm.size()));
+        pcm_playback_resampler_.Process(pcm.data(), pcm.size(), resampled.data());
+        pcm = std::move(resampled);
+    }
+
+    // 切成 60ms 一块，与 Opus 解码产物粒度一致，避免单块过大占住输出任务
+    const size_t frame = static_cast<size_t>(out_rate) * OPUS_FRAME_DURATION_MS / 1000;
+    size_t off = 0;
+    while (off < pcm.size()) {
+        const size_t n = std::min(frame, pcm.size() - off);
+        auto task = std::make_unique<AudioTask>();
+        task->type = kAudioTaskTypeDecodeToPlaybackQueue;
+        task->timestamp = 0;
+        task->pcm.assign(pcm.begin() + off, pcm.begin() + off + n);
+        off += n;
+
+        std::unique_lock<std::mutex> lock(audio_queue_mutex_);
+        // 播放队列给本地 PCM 放宽到 ~1s，减少阻塞抖动
+        constexpr size_t kMaxPcmTasks = 1000 / OPUS_FRAME_DURATION_MS;
+        while (!service_stopped_ && audio_playback_queue_.size() >= kMaxPcmTasks) {
+            if (cancel != nullptr && cancel->load(std::memory_order_acquire)) {
+                return false;
+            }
+            audio_queue_cv_.wait_for(lock, std::chrono::milliseconds(50));
+        }
+        if (service_stopped_ || (cancel != nullptr && cancel->load(std::memory_order_acquire))) {
+            return false;
+        }
+        audio_playback_queue_.push_back(std::move(task));
+        audio_queue_cv_.notify_all();
+    }
+    return true;
+}
+
+bool AudioService::IsPlaybackIdle() {
+    std::lock_guard<std::mutex> lock(audio_queue_mutex_);
+    return audio_decode_queue_.empty() && audio_playback_queue_.empty();
 }
 
 void AudioService::ResetDecoder() {

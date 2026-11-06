@@ -1,4 +1,9 @@
+#include "net_mode.h"
 #include "power_hw.h"
+#include "display/screen/standby_screen/standby_card.h"
+#include "soc/gpio_reg.h"
+#include "soc/rtc_cntl_reg.h"
+#include "soc/rtc_io_reg.h"
 #include "power_policy.h"
 
 #include "IOExpander.hpp"
@@ -293,6 +298,9 @@ esp_err_t power_hw_wifi_start(void)
         ESP_LOGI(TAG, "WiFi config AP started");
         return ESP_OK;
     }
+    if (net_mode::Offline()) {
+        return ESP_OK;  // 离线模式：策略想开网也不开
+    }
     auto& sta = WifiStation::GetInstance();
     if (sta.IsLpPaused()) {
         esp_err_t err = sta.ResumeFromLp();
@@ -408,17 +416,20 @@ esp_err_t power_hw_light_sleep_once(uint64_t max_sleep_us)
     esp_err_t err = gpio_wakeup_enable(POWER_BUTTON_GPIO, GPIO_INTR_LOW_LEVEL);
     if (err != ESP_OK) {
         ESP_LOGW(TAG, "POWER wake cfg failed: %s", esp_err_to_name(err));
+        StandbyCard_DbgLog("lp step fail: " "POWER wake cfg failed: %s", esp_err_to_name(err));
         return err;
     }
     err = esp_sleep_enable_gpio_wakeup();
     if (err != ESP_OK) {
         ESP_LOGW(TAG, "gpio wake enable failed: %s", esp_err_to_name(err));
+        StandbyCard_DbgLog("lp step fail: " "gpio wake enable failed: %s", esp_err_to_name(err));
         return err;
     }
     if (max_sleep_us > 0) {
         err = esp_sleep_enable_timer_wakeup(max_sleep_us);
         if (err != ESP_OK) {
             ESP_LOGW(TAG, "timer wake cfg failed: %s", esp_err_to_name(err));
+        StandbyCard_DbgLog("lp step fail: " "timer wake cfg failed: %s", esp_err_to_name(err));
             return err;
         }
     }
@@ -431,11 +442,58 @@ esp_err_t power_hw_light_sleep_once(uint64_t max_sleep_us)
     PowerPolicy::DebugSetLpPhase("uart_wait");
     uart_wait_tx_idle_polling(static_cast<uart_port_t>(CONFIG_ESP_CONSOLE_UART_NUM));
     #endif
+    // 别的脚（如 4G 模组 NT26 的 SRDY=GPIO5）留着 RTC 唤醒、且此刻正处于唤醒电平，
+    // 会让每次浅睡都被硬件立刻拒绝（reject_cause=GPIO），整夜空转耗电。这次睡眠先关掉它们，醒后恢复。
+    uint32_t muted_rtc = 0;
+    for (int r = 0; r < 22; ++r) {
+        if (r == static_cast<int>(POWER_BUTTON_GPIO)) continue;
+        const uint32_t reg = RTC_GPIO_PIN0_REG + 4 * r;
+        if (!REG_GET_BIT(reg, RTC_GPIO_PIN0_WAKEUP_ENABLE)) continue;
+        const uint32_t type = REG_GET_FIELD(reg, RTC_GPIO_PIN0_INT_TYPE);
+        const int lv = gpio_get_level(static_cast<gpio_num_t>(r));
+        if ((type == GPIO_INTR_LOW_LEVEL && lv == 0) || (type == GPIO_INTR_HIGH_LEVEL && lv == 1)) {
+            REG_CLR_BIT(reg, RTC_GPIO_PIN0_WAKEUP_ENABLE);
+            muted_rtc |= 1u << r;
+        }
+    }
+    if (muted_rtc) {
+        static uint32_t s_logged = 0;
+        if (s_logged != muted_rtc) {
+            s_logged = muted_rtc;
+            StandbyCard_DbgLog("sleep: muted rtc wake pins 0x%lx (already at wake level)",
+                               static_cast<unsigned long>(muted_rtc));
+        }
+    }
     EpdRstHoldForLightSleep();
     PowerPolicy::DebugSetLpPhase("in_sleep");
     cx25601n_vreg_suspend_for_sleep();
     err = esp_light_sleep_start();
+    if (err != ESP_OK) {
+        static int s_diag = 0;
+        if (s_diag++ % 60 == 0) {
+            // 哪些脚开着 GPIO 唤醒、当前电平（被拒说明有脚已经处于唤醒电平）
+            char buf[160];
+            int n = 0;
+            for (int g = 0; g < GPIO_NUM_MAX && n < static_cast<int>(sizeof(buf)) - 12; ++g) {
+                if (!GPIO_IS_VALID_GPIO(g)) continue;
+                if (REG_GET_BIT(GPIO_PIN0_REG + 4 * g, GPIO_PIN0_WAKEUP_ENABLE)) {
+                    n += snprintf(buf + n, sizeof(buf) - n, " %d(lv%d,t%d)", g, gpio_get_level(static_cast<gpio_num_t>(g)),
+                                  static_cast<int>(REG_GET_FIELD(GPIO_PIN0_REG + 4 * g, GPIO_PIN0_INT_TYPE)));
+                }
+            }
+            uint32_t rtcw = 0;
+            for (int r = 0; r < 22; ++r) {
+                if (REG_GET_BIT(RTC_GPIO_PIN0_REG + 4 * r, RTC_GPIO_PIN0_WAKEUP_ENABLE)) rtcw |= 1u << r;
+            }
+            StandbyCard_DbgLog("sleep reject: wake pins%s rtcio_wake=0x%lx reject_cause=0x%lx", n ? buf : " none",
+                               static_cast<unsigned long>(rtcw),
+                               static_cast<unsigned long>(REG_READ(RTC_CNTL_SLP_REJECT_CAUSE_REG) & RTC_CNTL_REJECT_CAUSE));
+        }
+    }
     cx25601n_vreg_resume_after_sleep();
+    for (int r = 0; r < 22; ++r) {
+        if (muted_rtc & (1u << r)) REG_SET_BIT(RTC_GPIO_PIN0_REG + 4 * r, RTC_GPIO_PIN0_WAKEUP_ENABLE);
+    }
     PowerPolicy::DebugSetLpPhase("sleep_ret");
     // 醒瞬间先锁存 POWER 电平，再打日志（UART 刷写会拖过短按）
     s_gpio_wake_boot_low = false;

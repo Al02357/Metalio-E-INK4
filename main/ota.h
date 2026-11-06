@@ -18,6 +18,10 @@ public:
     ~Ota();
 
     esp_err_t CheckVersion();
+    /** @brief 只查自建 OTA 服务（SD 卡 metalio/e-ink/ota.json）；未配置返回 ESP_ERR_NOT_FOUND */
+    esp_err_t CheckCustomFirmware();
+    /** @brief 是否配置了自建 OTA 服务 */
+    static bool HasCustomOta();
     esp_err_t CheckChatConfiguration();
     esp_err_t Activate();
     bool HasActivationChallenge() { return has_activation_challenge_; }
@@ -61,6 +65,7 @@ private:
     std::string current_version_;
     std::string firmware_version_;
     std::string firmware_url_;
+    bool skip_vendor_firmware_ = false;  // 配了自建 OTA 时，忽略原厂服务下发的固件（避免覆盖自定义固件）
     std::string activation_challenge_;
     std::string serial_number_;
     int activation_timeout_ms_ = 30000;

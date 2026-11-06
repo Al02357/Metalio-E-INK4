@@ -1,7 +1,10 @@
+#include "my_ai_screen/my_ai_screen.h"
+#include "quick_panel.h"
 #include "standby_screen/standby_screen.h"
 
 #include "standby_screen/standby_classic.h"
 #include "standby_screen/standby_wallpaper.h"
+#include "standby_screen/standby_card.h"
 
 #include "wallpaper_screen/wallpaper_active.h"
 
@@ -47,7 +50,8 @@ static void ClearStatusBindings() {
 }
 
 static bool PreferWallpaperVariant() {
-    return !Wallpaper_GetStandbyFilename().empty();
+    // 待机壁纸优先；没设壁纸时用信息卡（同走壁纸解码显示）
+    return !Wallpaper_GetStandbyFilename().empty() || StandbyCard_TryPath(nullptr, 0);
 }
 
 static void TeardownVariant() {
@@ -57,13 +61,16 @@ static void TeardownVariant() {
         StandbyWallpaper_Teardown();
     }
     s_variant = StandbyVariant::None;
+    StandbyCard_SetInUse(false);
 }
 
 static void MountVariant(lv_obj_t* root, bool as_overlay) {
     if (PreferWallpaperVariant()) {
         s_variant = StandbyVariant::Wallpaper;
-        ESP_LOGD(TAG, "variant=wallpaper");
+        StandbyCard_SetInUse(Wallpaper_GetStandbyFilename().empty());
+        ESP_LOGI(TAG, "variant=%s", Wallpaper_GetStandbyFilename().empty() ? "card" : "wallpaper");
         StandbyWallpaper_Build(root);
+        if (Wallpaper_GetStandbyFilename().empty()) StandbyCard_BuildLocal(root);  // 信息卡：天气、电量用本地数据
         StandbyWallpaper_StartLoad();
     } else {
         s_variant = StandbyVariant::Classic;
@@ -101,7 +108,7 @@ static bool StandbyOnVkKey(const char* /*key_name*/) {
 
 static void DismissThenAssistantAsync(void* /*arg*/) {
     StandbyScreen::Dismiss();
-    AssistantScreen::RequestOpen();
+    MyAiScreen::RequestOverlayNoShot(true);  // 待机长按：叠出我的AI 浮层，BOOT 仍按着就直接听
 }
 
 static bool OnBootClick() {
@@ -110,8 +117,8 @@ static bool OnBootClick() {
 }
 
 static bool OnBootLongPress() {
-    ESP_LOGI(TAG, "boot long -> assistant (hold-through PTT if still pressed)");
-    AssistantScreen::RequestOpen();
+    ESP_LOGI(TAG, "boot long -> my ai (hold-through PTT if still pressed)");
+    MyAiScreen::RequestOverlayNoShot(true);
     return true;
 }
 
@@ -136,6 +143,7 @@ void StandbyScreen::Show() {
     if (s_host_alive) {
         return;
     }
+    QuickPanel::Close();  // 快捷面板在 layer_top，进待机前收起
     lv_obj_t* under = lv_screen_active();
     if (under == nullptr) {
         ESP_LOGW(TAG, "show: no active screen");

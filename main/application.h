@@ -63,6 +63,10 @@ public:
     void SetLocalChatTtsEnabled(bool enabled);
     void WakeWordInvoke(const std::string& wake_word);
     bool UpgradeFirmware(Ota& ota, const std::string& url = "");
+    /** @brief 让后台 OTA 检查立刻跑一次（有新版本就弹窗） */
+    void RequestOtaPollNow();
+    /** @brief 有待升级的新固件（自建 OTA 检查到的），下拉面板用 */
+    bool GetPendingUpdate(std::string& cur, std::string& next, std::string& url);
     bool UpgradeFirmwareUrl(const std::string& url, const std::string& current_version,
                             const std::string& new_version);
     bool CanEnterSleepMode();

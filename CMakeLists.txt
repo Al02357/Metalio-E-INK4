@@ -4,7 +4,7 @@
 # CMakeLists in this exact order for cmake to work correctly
 cmake_minimum_required(VERSION 3.16)
 
-set(PROJECT_VER "2.0.63")
+set(PROJECT_VER "2.1.63")
 
 # Add this line to disable the specific warning
 add_compile_options(-Wno-missing-field-initializers)
@@ -31,3 +31,9 @@ if(EXISTS "${CMAKE_SOURCE_DIR}/wakeword/srmodels.bin")
     endif()
 endif()
 
+
+# LVGL 渲染是界面响应的大头：单独用 -O2 编（全局是 -Os），换页/开面板更快
+if(TARGET __idf_lvgl__lvgl)
+    target_compile_options(__idf_lvgl__lvgl PRIVATE -O2)
+    message(STATUS "lvgl compiled with -O2")
+endif()

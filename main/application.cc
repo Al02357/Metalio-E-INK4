@@ -1,4 +1,5 @@
 #include "application.h"
+#include "battery_log.h"
 #include "board.h"
 #include "power_policy.h"
 #include "display.h"
@@ -16,10 +17,16 @@
 #include "fontpack_lvgl.h"
 #include "settings.h"
 #include "standby_screen/standby_screen.h"
+#include "standby_screen/standby_classic.h"
+#include "standby_screen/standby_card.h"
 #include "task_screen/task_screen.h"
 #include "ota_upgrade_screen/ota_upgrade_screen.h"
 #include "ota_confirm_dialog/ota_confirm_dialog.h"
 #include "ota_ignore.h"
+#include "screen_common.h"
+#include <mutex>
+#include <freertos/idf_additions.h>
+#include <esp_heap_caps.h>
 #include "wallpaper_screen/wallpaper_active.h"
 #include "reader/book_home_snapshot.h"
 #include "reader/book_progress_sync.h"
@@ -705,6 +712,10 @@ void Application::CheckAssetsVersion() {
     display->SetEmotion("microchip_ai");
 }
 
+namespace {
+void SetPendingUpdate(const std::string& cur, const std::string& next, const std::string& url);
+}
+
 void Application::CheckNewVersion(Ota& ota) {
     const int MAX_RETRY = 10;
     int retry_count = 0;
@@ -769,7 +780,9 @@ void Application::CheckNewVersion(Ota& ota) {
         retry_count = 0;
         retry_delay = 10; // 重置重试延迟时间
 
-        if (ota.HasNewVersion()) {
+        if (ota.HasNewVersion() && Ota::HasCustomOta()) {
+            SetPendingUpdate(ota.GetCurrentVersion(), ota.GetFirmwareVersion(), ota.GetFirmwareUrl());
+        } else if (ota.HasNewVersion()) {
             const std::string& new_ver = ota.GetFirmwareVersion();
             if (OtaIgnore::IsIgnored(new_ver)) {
                 ESP_LOGI(TAG, "firmware %s ignored in NVS; skip prompt", new_ver.c_str());
@@ -1191,6 +1204,89 @@ void Application::FlushPendingXiaozhiVoice() {
     Schedule([this, enter_listening]() { StartXiaozhiVoice(enter_listening); });
 }
 
+// ---------------------------------------------------------------- 自建 OTA：后台定时检查，有新版本弹窗让用户手动升级
+
+namespace {
+
+std::atomic<bool> s_ota_poll_now{false};
+std::mutex s_ota_mu;
+std::string s_ota_cur, s_ota_next, s_ota_url;  // 有新固件时记下，下拉面板里显示；不主动弹窗
+
+void SetPendingUpdate(const std::string& cur, const std::string& next, const std::string& url) {
+    std::lock_guard<std::mutex> lock(s_ota_mu);
+    s_ota_cur = cur;
+    s_ota_next = next;
+    s_ota_url = url;
+    if (!next.empty()) ESP_LOGI(TAG, "firmware %s available (current %s), shown in quick panel", next.c_str(), cur.c_str());
+}
+
+void OtaPollTask(void*) {
+    constexpr int64_t kPeriodUs = 3LL * 3600 * 1000000;  // 3 小时查一次
+    int64_t next_us = esp_timer_get_time() + 120LL * 1000000;  // 开机 2 分钟后先查一次
+    constexpr int64_t kWxPeriodUs = 2LL * 3600 * 1000000;  // 天气按位置 2 小时刷新
+    int64_t next_wx_us = esp_timer_get_time() + kWxPeriodUs;
+    constexpr int64_t kBatPeriodUs = 60LL * 1000000;  // 每分钟看一次，满 10 分钟才真的记
+    int64_t next_bat_us = esp_timer_get_time() + 30LL * 1000000;
+    while (true) {
+        vTaskDelay(pdMS_TO_TICKS(5000));
+        if (esp_timer_get_time() >= next_bat_us) {
+            next_bat_us = esp_timer_get_time() + kBatPeriodUs;
+            // 写 SD 放到主循环（内部 RAM 栈）
+            Application::GetInstance().Schedule([]() { BatteryLog_MaybeSample(false); });
+        }
+        if (esp_timer_get_time() >= next_wx_us) {
+            next_wx_us = esp_timer_get_time() + kWxPeriodUs;
+            if (!StandbyScreen::IsActive() && Application::GetInstance().GetDeviceState() != kDeviceStateUpgrading) {
+                PowerNeedHold hold(PowerNeed::OtaDownload);
+                if (Board::GetInstance().IsNetworkReady() || Board::GetInstance().EnsureNetworkReady(20000)) {
+                    // 本任务栈在 PSRAM，不能写 NVS：交给内部 RAM 栈的 standby_wx 任务去拉，这里只占网等它完成
+                    StandbyClassic_ScheduleWeatherEnsure();
+                    for (int i = 0; i < 60 && StandbyClassic_WeatherBusy(); ++i) vTaskDelay(pdMS_TO_TICKS(500));
+                }
+            }
+        }
+        const bool now = s_ota_poll_now.exchange(false);
+        if (!now && esp_timer_get_time() < next_us) continue;
+        next_us = esp_timer_get_time() + kPeriodUs;
+        auto& app = Application::GetInstance();
+        auto& board = Board::GetInstance();
+        // 不打断升级 / 待机 / 已有弹窗
+        if (app.GetDeviceState() == kDeviceStateUpgrading || StandbyScreen::IsActive() ||
+            OtaConfirmDialog::IsActive()) {
+            if (now) ESP_LOGI(TAG, "ota poll skipped (busy)");
+            continue;
+        }
+        Ota ota;
+        {
+            // Wi-Fi 可能被省电策略关了：临时占网查一次，查完释放
+            PowerNeedHold hold(PowerNeed::OtaDownload);
+            if (!board.IsNetworkReady() && !board.EnsureNetworkReady(20000)) {
+                ESP_LOGI(TAG, "ota poll: network not ready");
+                continue;
+            }
+                if (ota.CheckCustomFirmware() != ESP_OK) continue;
+        }
+        if (ota.HasNewVersion()) {
+            SetPendingUpdate(ota.GetCurrentVersion(), ota.GetFirmwareVersion(), ota.GetFirmwareUrl());
+        } else {
+            SetPendingUpdate("", "", "");
+        }
+    }
+}
+
+}  // namespace
+
+void Application::RequestOtaPollNow() { s_ota_poll_now.store(true); }
+
+bool Application::GetPendingUpdate(std::string& cur, std::string& next, std::string& url) {
+    std::lock_guard<std::mutex> lock(s_ota_mu);
+    if (s_ota_next.empty()) return false;
+    cur = s_ota_cur;
+    next = s_ota_next;
+    url = s_ota_url;
+    return true;
+}
+
 void Application::Start() {
     chat_cloud::InitializeFromNvs();
     // UI 语言：NVS ui/language，无则 LANG_DEFAULT_CODE（跟 CONFIG_LANGUAGE_*）
@@ -1278,6 +1374,10 @@ void Application::Start() {
 
     // Check for new firmware version or get the MQTT broker address（OTA 不变）
     CheckNewVersion(ota);
+    if (Ota::HasCustomOta()) {
+        xTaskCreateWithCaps(OtaPollTask, "ota_poll", 6 * 1024, nullptr, 2, nullptr,
+                            MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    }
 
     has_server_time_ = ota.HasServerTime();
     current_version_ = ota.GetCurrentVersion();
@@ -1287,7 +1387,8 @@ void Application::Start() {
         board.OnNetworkTimeSynced();
     }
 
-    // 天气：每天开机拉一次，写入 NVS；当天后续走缓存
+    // 天气：开机拉一次（自建服务器按 IP 定位），之后 ota_poll 任务每 2 小时刷新
+    StandbyCard_Enabled();  // 主任务（内部 RAM 栈）里先读 NVS
     StandbyScreen::EnsureWeatherCached();
     // 壁纸启用：同步灌关机+待机 NVS→缓存，供待机入口路由（勿在 LVGL 任务）
     Wallpaper_HydrateFromNvsNow();

@@ -1,4 +1,5 @@
 #include "http_client.h"
+#include <memory>
 #include "network_interface.h"
 #include <esp_log.h>
 #include <cstring>
@@ -760,32 +761,20 @@ void HttpClient::AddBodyData(std::string&& data) {
 }
 
 std::string HttpClient::ReadAll() {
-    std::unique_lock<std::mutex> lock(mutex_);
-
-    // 等待完成或出错
-    auto timeout = std::chrono::milliseconds(timeout_ms_);
-    bool completed = cv_.wait_for(lock, timeout, [this] {
-        return eof_ || connection_error_;
-    });
-
-    if (!completed) {
-        ESP_LOGE(TAG, "Wait for HTTP content receive complete timeout");
-        return "";  // 超时返回空字符串
-    }
-
-    // 如果连接异常断开，返回空字符串并记录错误
-    if (connection_error_) {
-        ESP_LOGE(TAG, "Cannot read all data: connection closed prematurely");
-        return "";
-    }
-
-    // 收集所有数据
+    // 边收边取：接收缓存满 48KB 时 tcp_receive 会停下等人取数据，只等 eof 不取的话大于 48KB 的响应永远收不完；
+    // 卡住的连接还占着 WiFi 收包缓冲，整个网络都会断（连网关都不通）
     std::string result;
-    std::lock_guard<std::mutex> read_lock(read_mutex_);
-    for (const auto& chunk : body_chunks_) {
-        result.append(chunk.data);
+    constexpr size_t kBuf = 4096;
+    std::unique_ptr<char[]> buf(new char[kBuf]);
+    for (;;) {
+        const int n = Read(buf.get(), kBuf);
+        if (n < 0) {
+            ESP_LOGE(TAG, "ReadAll failed after %u bytes", static_cast<unsigned>(result.size()));
+            return "";
+        }
+        if (n == 0) break;
+        result.append(buf.get(), static_cast<size_t>(n));
     }
-
     return result;
 }
 

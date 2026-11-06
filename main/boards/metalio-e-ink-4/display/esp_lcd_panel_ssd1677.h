@@ -39,6 +39,7 @@ typedef enum {
     SSD1677_EPAPER_REFRESH_PARTIAL,   // 局刷（旧 0xCF / 优化 0xCC）
     SSD1677_EPAPER_REFRESH_STANDBY,   // 进/出待机与关机（同全刷档）
     SSD1677_EPAPER_REFRESH_GRAY,      // 0x22=0xCC + 外置灰 LUT（同步等 BUSY）
+    SSD1677_EPAPER_REFRESH_CUSTOM,    // 0x22=0xCC + 调用方 epaper_panel_load_custom_lut 下发的 LUT（同步等 BUSY）
 } esp_lcd_ssd1677_refresh_mode_t;
 
 /**
@@ -77,6 +78,22 @@ esp_err_t epaper_panel_register_event_callbacks(esp_lcd_panel_t *panel, epaper_p
  * @brief 每次局刷前：写边框 0x80（无 HW RST / soft reset）
  */
 esp_err_t epaper_panel_prepare_for_partial(esp_lcd_panel_t *panel);
+
+/** 下发调用方自己的 112 字节 LUT（格式同 epd_lut_4gray.h）；配合 SSD1677_EPAPER_REFRESH_CUSTOM 使用 */
+esp_err_t epaper_panel_load_custom_lut(esp_lcd_panel_t *panel, const uint8_t *lut112);
+/** 改局刷 LUT 的帧数/帧率（<=0 表示不改），下次局刷生效 */
+void epaper_panel_set_partial_timing(esp_lcd_panel_t *panel, int tp0, int tp1, int fr);
+/** 局刷后面板模拟电路是否还开着 */
+bool epaper_panel_analog_on(esp_lcd_panel_t *panel);
+/** 最近一次刷新发的 0x22 参数 */
+uint8_t epaper_panel_last_ctrl2(esp_lcd_panel_t *panel);
+/** 开着就掉电（0x22=0x83 + 0x20，等 BUSY）；调用方须保证没有刷新在进行 */
+/** 刷完、模拟电源还开着时把 VCOM 拉回 0（不给面板留直流偏压）；下次刷新自动重载 LUT */
+esp_err_t epaper_panel_park_vcom(esp_lcd_panel_t *panel);
+esp_err_t epaper_panel_power_off_if_on(esp_lcd_panel_t *panel);
+
+/** 最近一次刷新的 BUSY 时长（ms），耗时打点用 */
+uint32_t epaper_panel_last_busy_ms(esp_lcd_panel_t *panel);
 
 /**
  * @brief 进入 Deep Sleep（0x10）；唤醒需硬件 RST

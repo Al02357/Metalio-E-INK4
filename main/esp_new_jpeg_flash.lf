@@ -1,0 +1,14 @@
+# esp_new_jpeg puts its asm hot paths in .iram1 (~27KB internal RAM).
+# Only used for AI screenshot encoding, never with cache disabled -> run from flash.
+[sections:jpeg_iram1]
+entries:
+    .iram1+
+
+[scheme:jpeg_to_flash]
+entries:
+    jpeg_iram1 -> flash_text
+
+[mapping:esp_new_jpeg_flash]
+archive: libesp_new_jpeg.a
+entries:
+    * (jpeg_to_flash)

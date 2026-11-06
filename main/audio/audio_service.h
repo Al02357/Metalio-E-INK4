@@ -2,6 +2,9 @@
 #define AUDIO_SERVICE_H
 
 #include <memory>
+#include <atomic>
+#include <functional>
+#include <vector>
 #include <deque>
 #include <condition_variable>
 #include <chrono>
@@ -113,6 +116,17 @@ public:
     void PlaySound(const std::string_view& ogg);
     void SetModelsList(srmodel_list_t* models_list);
 
+    // 「我的 AI」等本地链路：非空时语音处理器输出的 16kHz 单声道 PCM 直接交给 sink，
+    // 不再进 Opus 编码/发送队列。sink 在 AFE 输出任务里调用，须尽快返回。
+    using PcmSink = std::function<void(std::vector<int16_t>&& pcm)>;
+    void SetPcmCaptureSink(PcmSink sink);
+    // 推 PCM 到播放队列（必要时重采样到 codec 输出采样率）；队列满时阻塞等待。
+    // cancel 置位或服务停止时返回 false。
+    bool PushPcmToPlayback(std::vector<int16_t>&& pcm, int sample_rate,
+                           const std::atomic<bool>* cancel = nullptr);
+    // 播放队列与解码队列均为空
+    bool IsPlaybackIdle();
+
 private:
     // opus_codec: large stack in PSRAM (wake_word encode pattern); TCB in INTERNAL.
     static constexpr size_t kOpusCodecStackWords = 2048 * 13;
@@ -126,6 +140,10 @@ private:
     OpusResampler input_resampler_;
     OpusResampler reference_resampler_;
     OpusResampler output_resampler_;
+    OpusResampler pcm_playback_resampler_;
+    int pcm_playback_rate_ = 0;
+    std::mutex pcm_sink_mutex_;
+    PcmSink pcm_sink_;
     DebugStatistics debug_statistics_;
     srmodel_list_t* models_list_ = nullptr;
 

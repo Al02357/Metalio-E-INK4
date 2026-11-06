@@ -40,6 +40,16 @@
         // 左右斜边平行，水平间隙 = COL_GAP（与行间距同）；bbox 仍重叠 SLANT-COL_GAP
         const lv_coord_t cell_w =
             (LV_HOR_RES - 2 * HOME_SLASH_SIDE_PAD + HOME_SLASH_SLANT - HOME_SLASH_COL_GAP) / 2;
+        const int pages = Home_PageCount();
+        if (Home_page >= pages)
+        {
+            Home_page = pages > 0 ? pages - 1 : 0;
+        }
+        if (Home_page < 0)
+        {
+            Home_page = 0;
+        }
+        const int page_base = Home_page * kSlashAppsPerPage;
         for (int r = 0; r < HOME_SLASH_ROWS; ++r)
         {
             lv_obj_t *row = lv_obj_create(Home_apps);
@@ -50,7 +60,7 @@
             lv_obj_clear_flag(row, LV_OBJ_FLAG_SCROLLABLE);
             lv_obj_clear_flag(row, LV_OBJ_FLAG_CLICKABLE);
 
-            const int base = r * 2;
+            const int base = page_base + r * 2;
             if (base < kSlashAppCount)
             {
                 Home_CreateSlashAppCell(row, kSlashApps[base], r, 0, row_h, cell_w);
@@ -62,7 +72,17 @@
         }
         if (Home_page_lbl != nullptr)
         {
-            lv_obj_add_flag(Home_page_lbl, LV_OBJ_FLAG_HIDDEN);
+            if (pages > 1)
+            {
+                char buf[32];
+                std::snprintf(buf, sizeof(buf), "%d / %d", Home_page + 1, pages);
+                lv_label_set_text(Home_page_lbl, buf);
+                lv_obj_clear_flag(Home_page_lbl, LV_OBJ_FLAG_HIDDEN);
+            }
+            else
+            {
+                lv_obj_add_flag(Home_page_lbl, LV_OBJ_FLAG_HIDDEN);
+            }
         }
         ESP_LOGD(TAG, "slash apps %d row_h=%d cell_w=%d", kSlashAppCount, static_cast<int>(row_h),
                  static_cast<int>(cell_w));

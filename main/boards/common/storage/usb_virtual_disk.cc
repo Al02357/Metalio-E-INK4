@@ -616,6 +616,8 @@ void UsbWorkerTask(void* /*arg*/) {
             continue;
         }
         s_op_in_progress.store(true, std::memory_order_relaxed);
+        ESP_LOGI(TAG, "usb_vd_worker req=%d stack free=%u", static_cast<int>(req),
+                 static_cast<unsigned>(uxTaskGetStackHighWaterMark(nullptr)));
         SetHint(UsbVirtualDisk::UiHint::Switching);
         NotifyUi();
 
@@ -712,7 +714,7 @@ void UsbVirtualDisk::Init() {
         return;
     }
     BaseType_t ok =
-        xTaskCreate(UsbWorkerTask, "usb_vd_worker", 12288, nullptr, 6, nullptr);
+        xTaskCreate(UsbWorkerTask, "usb_vd_worker", 6144, nullptr, 6, nullptr);  // 原 12KB，空闲时只用了不到 1KB
     if (ok != pdPASS) {
         ESP_LOGE(TAG, "create usb worker failed");
         vQueueDelete(s_usb_req_queue);

@@ -33,6 +33,14 @@ void StandbyClassic_EnsureWeatherCached();
 
 /** @brief 持锁拷贝当日天气 RAM；无有效缓存返回 false。 */
 bool StandbyClassic_CopyWeatherView(StandbyClassicWeatherView* out);
+/** 后台（内部 RAM 栈任务）刷新天气；数据仍新鲜时什么也不做。 */
+void StandbyClassic_ScheduleWeatherEnsure();
+/** 天气拉取任务是否还在跑。 */
+bool StandbyClassic_WeatherBusy();
+/** 天气标签文案：有城市时为「北京 阴」，否则只有天气。 */
+void StandbyClassic_FormatWeatherLabel(char* out, size_t out_len);
+/** 给 AI 用的位置与天气摘要（一行），没有数据时返回空串。 */
+size_t StandbyClassic_LocationWeatherForAi(char* out, size_t out_len);
 
 /** @brief 天气缓存更新后在 LVGL 任务回调（与 classic ApplyWeatherUi 同一次 async）。 */
 using StandbyClassicWeatherUiListener = void (*)();

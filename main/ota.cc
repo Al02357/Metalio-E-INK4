@@ -1,4 +1,5 @@
 #include "ota.h"
+#include "sd_paths.h"
 #include "api_endpoints.h"
 #include "chat_cloud.h"
 #include "api_http.h"
@@ -47,6 +48,72 @@ Ota::Ota() {
 Ota::~Ota() {
 }
 
+namespace {
+
+struct CustomOtaCfg {
+    std::string url;    // 例 http://IP:8080/ota/check
+    std::string token;  // 请求头 X-Token
+};
+
+CustomOtaCfg LoadCustomOta() {
+    CustomOtaCfg c;
+    FILE* f = std::fopen(SD_APP_ROOT "/ota.json", "rb");
+    if (f == nullptr) return c;
+    char buf[1024];
+    const size_t n = std::fread(buf, 1, sizeof(buf) - 1, f);
+    std::fclose(f);
+    buf[n] = '\0';
+    cJSON* root = cJSON_Parse(buf);
+    if (root == nullptr) return c;
+    const cJSON* u = cJSON_GetObjectItem(root, "url");
+    const cJSON* t = cJSON_GetObjectItem(root, "token");
+    if (cJSON_IsString(u)) c.url = u->valuestring;
+    if (cJSON_IsString(t)) c.token = t->valuestring;
+    cJSON_Delete(root);
+    return c;
+}
+
+}  // namespace
+
+bool Ota::HasCustomOta() { return !LoadCustomOta().url.empty(); }
+
+esp_err_t Ota::CheckCustomFirmware() {
+    const CustomOtaCfg cfg = LoadCustomOta();
+    if (cfg.url.empty()) return ESP_ERR_NOT_FOUND;
+    current_version_ = esp_app_get_description()->version;
+    auto network = Board::GetInstance().GetNetwork();
+    auto http = network ? network->CreateHttp(0) : nullptr;
+    if (!http) return ESP_FAIL;
+    http->SetTimeout(15000);
+    if (!cfg.token.empty()) http->SetHeader("X-Token", cfg.token);
+    if (!http->Open("GET", cfg.url)) {
+        ESP_LOGW(TAG, "custom ota: open %s failed", cfg.url.c_str());
+        return ESP_FAIL;
+    }
+    const int status = http->GetStatusCode();
+    const std::string body = http->ReadAll();
+    http->Close();
+    if (status != 200) {
+        ESP_LOGW(TAG, "custom ota: status %d", status);
+        return ESP_FAIL;
+    }
+    cJSON* root = cJSON_Parse(body.c_str());
+    if (root == nullptr) return ESP_ERR_INVALID_RESPONSE;
+    has_new_version_ = false;
+    const cJSON* fw = cJSON_GetObjectItem(root, "firmware");
+    const cJSON* v = fw ? cJSON_GetObjectItem(fw, "version") : nullptr;
+    const cJSON* u = fw ? cJSON_GetObjectItem(fw, "url") : nullptr;
+    if (cJSON_IsString(v) && cJSON_IsString(u)) {
+        firmware_version_ = v->valuestring;
+        firmware_url_ = u->valuestring;
+        has_new_version_ = IsNewVersionAvailable(current_version_, firmware_version_);
+    }
+    cJSON_Delete(root);
+    ESP_LOGI(TAG, "custom ota: current=%s latest=%s new=%d", current_version_.c_str(),
+             firmware_version_.c_str(), has_new_version_ ? 1 : 0);
+    return ESP_OK;
+}
+
 std::string Ota::GetCheckVersionUrl() {
     // Firmware updates always use our own endpoint, regardless of chat provider.
     return api::HasDefaultOtaUrl() ? api::kDefaultOtaUrl : std::string();
@@ -74,7 +141,17 @@ std::unique_ptr<Http> Ota::SetupHttp() {
  * Specification: https://ccnphfhqs21z.feishu.cn/wiki/FjW6wZmisimNBBkov6OcmfvknVd
  */
 esp_err_t Ota::CheckVersion() {
-    return CheckResponse(false);
+    if (!HasCustomOta()) {
+        return CheckResponse(false);
+    }
+    // 原厂服务照常请求（激活、对时等），但固件只认自建服务
+    skip_vendor_firmware_ = true;
+    const esp_err_t vendor = CheckResponse(false);
+    skip_vendor_firmware_ = false;
+    if (vendor != ESP_OK) {
+        ESP_LOGW(TAG, "vendor check failed (%d), use custom ota only", vendor);
+    }
+    return CheckCustomFirmware();
 }
 
 esp_err_t Ota::CheckChatConfiguration() {
@@ -238,7 +315,7 @@ esp_err_t Ota::CheckResponse(bool chat_only) {
     has_new_version_ = false;
     cJSON *firmware = cJSON_GetObjectItem(root, "firmware");
     // Only our firmware check can supply an upgrade version and download URL.
-    if (!chat_only && cJSON_IsObject(firmware)) {
+    if (!chat_only && !skip_vendor_firmware_ && cJSON_IsObject(firmware)) {
         cJSON *version = cJSON_GetObjectItem(firmware, "version");
         if (cJSON_IsString(version)) {
             firmware_version_ = version->valuestring;
@@ -258,7 +335,7 @@ esp_err_t Ota::CheckResponse(bool chat_only) {
             }
             // 忽略服务端 firmware.force：仅按版本比较决定是否提示升级
         }
-    } else if (!chat_only) {
+    } else if (!chat_only && !skip_vendor_firmware_) {
         ESP_LOGW(TAG, "No firmware section found!");
     }
 

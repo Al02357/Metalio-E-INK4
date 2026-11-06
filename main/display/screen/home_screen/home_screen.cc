@@ -1,4 +1,11 @@
 #include "home_screen/home_screen_priv.h"
+#include "translate_screen/translate_screen.h"
+#include "monitor_screen/monitor_screen.h"
+#include "monitor_screen/monitor_icon.h"
+#include "gallery_screen/gallery_screen.h"
+#include "gallery_screen/gallery_icon.h"
+#include "blehid_screen/blehid_screen.h"
+#include "blehid_screen/blehid_icon.h"
 
 #include "home_screen_priv.h"
 #include "home_screen_ui.h"
@@ -8,6 +15,8 @@
 #include "assistant_screen/assistant_screen.h"
 #include "assets/lang_config.h"
 #include "book_screen/book_screen.h"
+#include "my_ai_screen/my_ai_screen.h"
+#include "weread_screen/weread_screen.h"
 #include "cloud_screen/cloud_screen.h"
 #include "haptic_feedback.h"
 #include "lv_adapter_display.h"
@@ -38,6 +47,12 @@ bool Home_gray_dither_ready = false;
     const char *Home_AppNameWallpaper() { return Lang::Strings::HOME_APP_WALLPAPER; }
     const char *Home_AppNameCloud() { return Lang::Strings::HOME_APP_CLOUD; }
     const char *Home_AppNameSettings() { return Lang::Strings::HOME_APP_SETTINGS; }
+    const char *Home_AppNameMyAi() { return "我的AI"; }
+    const char *Home_AppNameWeRead() { return "微信读书"; }
+    const char *Home_AppNameMonitor() { return "监控"; }
+    const char *Home_AppNameTranslate() { return "翻译"; }
+    const char *Home_AppNameGallery() { return "看图"; }
+    const char *Home_AppNameBleHid() { return "蓝牙键鼠"; }
 
     extern const AppEntry kApps[] = {
         {"A:ic_app_home_task.spng", Home_AppNameTask, TaskScreen::Create},
@@ -46,6 +61,12 @@ bool Home_gray_dither_ready = false;
         {"A:ic_app_home_wallpaper.spng", Home_AppNameWallpaper, WallpaperScreen::Create},
         {"A:ic_app_home_cloud.spng", Home_AppNameCloud, CloudScreen::Create},
         {"A:ic_app_home_setting.spng", Home_AppNameSettings, SettingsScreen::Create},
+        {"A:ic_app_home_buddy.spng", Home_AppNameMyAi, MyAiScreen::Create},
+        {"A:ic_app_home_study.spng", Home_AppNameWeRead, WeReadScreen::Create},
+        {reinterpret_cast<const char*>(MonitorIcon()), Home_AppNameMonitor, MonitorScreen::Create},
+        {"A:ic_app_home_translate.spng", Home_AppNameTranslate, TranslateScreen::Create},
+        {reinterpret_cast<const char*>(GalleryIcon()), Home_AppNameGallery, GalleryScreen::Create},
+        {reinterpret_cast<const char*>(BleHidIcon()), Home_AppNameBleHid, BleHidScreen::Create},
     };
 
     // 仅对外展示用户可见的应用，保持首页与设计稿一致。
@@ -56,9 +77,15 @@ bool Home_gray_dither_ready = false;
         {"A:ic_app_home_task.spng", Home_AppNameTask, TaskScreen::Create},
         {"A:ic_app_home_cloud.spng", Home_AppNameCloud, CloudScreen::Create},
         {"A:ic_app_home_setting.spng", Home_AppNameSettings, SettingsScreen::Create},
+        {"A:ic_app_home_buddy.spng", Home_AppNameMyAi, MyAiScreen::Create},
+        {"A:ic_app_home_study.spng", Home_AppNameWeRead, WeReadScreen::Create},
+        {reinterpret_cast<const char*>(MonitorIcon()), Home_AppNameMonitor, MonitorScreen::Create},
+        {"A:ic_app_home_translate.spng", Home_AppNameTranslate, TranslateScreen::Create},
+        {reinterpret_cast<const char*>(GalleryIcon()), Home_AppNameGallery, GalleryScreen::Create},
+        {reinterpret_cast<const char*>(BleHidIcon()), Home_AppNameBleHid, BleHidScreen::Create},
     };
 
-    // 随 kApps 自动变长；页数 = ceil(总数 / 每页 12)
+    // 随 kApps 自动变长；页数 = ceil(总数 / 每页 kAppsPerPage)
     extern const int kTotalApps = static_cast<int>(sizeof(kApps) / sizeof(kApps[0]));
     extern const int kSlashAppCount = static_cast<int>(sizeof(kSlashApps) / sizeof(kSlashApps[0]));
 
@@ -73,7 +100,7 @@ int Home_PageCount()
     {
         if (Home_slash_layout)
         {
-            return 1;
+            return (kSlashAppCount + kSlashAppsPerPage - 1) / kSlashAppsPerPage;
         }
         return (kTotalApps + kAppsPerPage - 1) / kAppsPerPage;
     }
@@ -407,7 +434,14 @@ lv_obj_t *HomeScreen::Create()
         lv_obj_clear_flag(Home_apps, LV_OBJ_FLAG_SCROLLABLE);
         lv_obj_clear_flag(Home_apps, LV_OBJ_FLAG_CLICKABLE);
 
-        Home_page_lbl = nullptr;
+        // 超过一页（6 个）时在宫格右上角显示页码，盖板 PREV/NEXT 翻页
+        Home_page_lbl = lv_label_create(scr);
+        lv_label_set_text(Home_page_lbl, "");
+        lv_obj_set_style_text_font(Home_page_lbl, fontpack_lv_font_ui(), 0);
+        lv_obj_set_style_text_color(Home_page_lbl, lv_color_black(), 0);
+        lv_obj_align_to(Home_page_lbl, Home_apps, LV_ALIGN_OUT_TOP_RIGHT, -HOME_SLASH_SIDE_PAD, -4);
+        lv_obj_clear_flag(Home_page_lbl, LV_OBJ_FLAG_CLICKABLE);
+        lv_obj_add_flag(Home_page_lbl, LV_OBJ_FLAG_HIDDEN);
         Home_FillAppsPage();
 
         lv_obj_add_event_cb(scr, Home_OnHomeDeleted, LV_EVENT_DELETE, nullptr);

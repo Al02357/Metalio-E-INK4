@@ -10,6 +10,7 @@
 #include "esp_check.h"
 #include "esp_heap_caps.h"
 #include "esp_memory_utils.h"
+#include "esp_timer.h"
 #include "driver/gpio.h"
 #include "esp_lcd_panel_ssd1677.h"
 #include "esp_lcd_panel_interface.h"
@@ -20,6 +21,12 @@
 #include "esp_lcd_ssd1677_commands.h"
 #include "epd_lut_fastupdate.h"
 #include "epd_lut_partial.h"
+#ifndef EPD_PARTIAL_TP0
+#define EPD_PARTIAL_TP0 13  /* 组0：主驱动帧数（原 13） */
+#endif
+#ifndef EPD_PARTIAL_TP1
+#define EPD_PARTIAL_TP1 4   /* 组1：补压帧数（原 4） */
+#endif
 #include "epd_lut_4gray.h"
 
 static const char *TAG = "lcd_panel.ssd1677";
@@ -29,6 +36,7 @@ typedef enum {
     EPD_LOADED_LUT_FAST,     // 快速全刷 LUT
     EPD_LOADED_LUT_PARTIAL,  // 局刷 LUT
     EPD_LOADED_LUT_GRAY,     // 灰刷 LUT
+    EPD_LOADED_LUT_CUSTOM,   // 调用方自定义 LUT（看图调灰度）
 } epd_loaded_lut_t;
 
 typedef struct {
@@ -48,6 +56,10 @@ typedef struct {
     esp_lcd_ssd1677_bitmap_color_t bitmap_color; // 当前写 0x24/0x26
     esp_lcd_ssd1677_refresh_mode_t refresh_mode; // 下次刷新模式
     epd_loaded_lut_t loaded_lut;            // 芯片内已下发的 MCU LUT
+    bool analog_on;                         // 模拟电路（升压/源极电源）当前开着：局刷可省掉上电那 80～220ms
+    uint8_t last_ctrl2;                     // 最近一次刷新的 0x22 参数（日志/反馈用）
+    int64_t act_us;                         // 最近一次 0x20 激活时刻（耗时打点）
+    volatile uint32_t last_busy_ms;         // 最近一次刷新 BUSY 时长
     bool _non_copy_mode;                    // true：不分配内部 framebuffer
     bool _mirror_x;                         // X 镜像
     bool _mirror_y;                         // Y 镜像
@@ -60,6 +72,9 @@ static inline uint8_t byte_reverse(uint8_t data);
 static esp_err_t process_bitmap(esp_lcd_panel_t *panel, int len_x, int len_y, int src_stride, int dst_stride,
                                 const void *color_data);
 static esp_err_t panel_epaper_wait_busy(esp_lcd_panel_t *panel);
+extern uint8_t g_ssd1677_partial_ctrl2;
+extern uint8_t g_ssd1677_gray_ctrl2;
+extern int g_ssd1677_gray_vcom_after;
 static void epaper_driver_gpio_isr_handler(void *arg);
 static esp_err_t epaper_set_ram_area(esp_lcd_panel_io_handle_t io, uint16_t x, uint16_t y, uint16_t w, uint16_t h);
 static esp_err_t epaper_panel_load_fast_lut(esp_lcd_panel_t *panel);
@@ -81,6 +96,9 @@ static void epaper_driver_gpio_isr_handler(void *arg)
 {
     epaper_panel_t *epaper_panel = arg;
     gpio_intr_disable(epaper_panel->busy_gpio_num);
+    if (epaper_panel->act_us) {
+        epaper_panel->last_busy_ms = (uint32_t)((esp_timer_get_time() - epaper_panel->act_us) / 1000);
+    }
     if (epaper_panel->epaper_refresh_done_isr_callback.callback_ptr) {
         (epaper_panel->epaper_refresh_done_isr_callback.callback_ptr)(&(epaper_panel->base), NULL,
                                                                     epaper_panel->epaper_refresh_done_isr_callback.args);
@@ -181,10 +199,17 @@ esp_err_t epaper_panel_refresh_screen(esp_lcd_panel_t *panel)
                                                       (uint8_t[]) { 0x6A }, 1), TAG, "WRITE_TEMP err");
         break;
     case SSD1677_EPAPER_REFRESH_PARTIAL:
-        ctrl2 = SSD1677_PARAM_DISP_UPDATE_PARTIAL;
+        // 0xCC = 开时钟+开模拟+显示；上一次刷新没关模拟（0xCC/0xC4 都不关）时再「开」一遍要多等 80～220ms。
+        // 已开着就只发 0x0C（只跑显示），波形一样。
+        // 局刷刷完保持上电（0xCC），连续操作时后面的局刷只发 0x0C，省每次上下电约 220ms；
+        // 空闲 2.5 秒由上层掉电。2.1.35～2.1.37 用过一次，桌面时钟出现过重叠，2.1.40 起重新开启并记录 0x22 便于反馈分析。
+        ctrl2 = g_ssd1677_partial_ctrl2 ? g_ssd1677_partial_ctrl2 : (epaper_panel->analog_on ? 0x0C : 0xCC);
         break;
     case SSD1677_EPAPER_REFRESH_GRAY:
-        ctrl2 = SSD1677_PARAM_DISP_UPDATE_GRAY; // 0xCC：外置 LUT，不重载 OTP
+    case SSD1677_EPAPER_REFRESH_CUSTOM:
+        // 外置 LUT，不重载 OTP。以前是 0xCC（刷完不掉电）：出灰后面板一直带电，灰阶会在一两秒内慢慢漂
+        //（白变灰、浅灰变白，用户实测）。0xCF 在波形最后一帧后立即掉电，和普通局刷一样。
+        ctrl2 = g_ssd1677_gray_ctrl2;
         break;
     default:
         return ESP_ERR_INVALID_ARG;
@@ -196,10 +221,13 @@ esp_err_t epaper_panel_refresh_screen(esp_lcd_panel_t *panel)
     const bool full_sync = (epaper_panel->refresh_mode == SSD1677_EPAPER_REFRESH_FULL ||
                             epaper_panel->refresh_mode == SSD1677_EPAPER_REFRESH_STANDBY ||
                             epaper_panel->refresh_mode == SSD1677_EPAPER_REFRESH_FULL_FAST ||
-                            epaper_panel->refresh_mode == SSD1677_EPAPER_REFRESH_GRAY);
+                            epaper_panel->refresh_mode == SSD1677_EPAPER_REFRESH_GRAY ||
+                            epaper_panel->refresh_mode == SSD1677_EPAPER_REFRESH_CUSTOM);
     // 仅在全刷/局刷/灰刷切换时重载对应 LUT。
-    if (epaper_panel->refresh_mode == SSD1677_EPAPER_REFRESH_GRAY) {
-        if (epaper_panel->loaded_lut != EPD_LOADED_LUT_GRAY) {
+    if (epaper_panel->refresh_mode == SSD1677_EPAPER_REFRESH_GRAY ||
+        epaper_panel->refresh_mode == SSD1677_EPAPER_REFRESH_CUSTOM) {
+        if (epaper_panel->refresh_mode == SSD1677_EPAPER_REFRESH_GRAY &&
+            epaper_panel->loaded_lut != EPD_LOADED_LUT_GRAY) {
             ESP_RETURN_ON_ERROR(epaper_panel_load_gray_lut(panel), TAG, "gray lut");
         }
         // 4 灰需使用 RED 平面，勿 bypass（Cross：单字节 CTRL1_NORMAL）
@@ -218,12 +246,28 @@ esp_err_t epaper_panel_refresh_screen(esp_lcd_panel_t *panel)
 
     ESP_RETURN_ON_ERROR(esp_lcd_panel_io_tx_param(epaper_panel->io, SSD1677_CMD_DISP_UPDATE_CTRL2,
                                                   (uint8_t[]) { ctrl2 }, 1), TAG, "DISP_UPDATE_CTRL2 err");
+    epaper_panel->last_ctrl2 = ctrl2;
+    // bit6 开模拟，bit1 关模拟（本次显示结束后）
+    epaper_panel->analog_on = ((ctrl2 & 0x40) != 0 || epaper_panel->analog_on) && (ctrl2 & 0x02) == 0;
 
     if (full_sync) {
         // 全刷：同步轮询 BUSY，不挂下降沿 ISR。
+        epaper_panel->act_us = esp_timer_get_time();
         ESP_RETURN_ON_ERROR(esp_lcd_panel_io_tx_param(epaper_panel->io, SSD1677_CMD_MASTER_ACTIVATION, NULL, 0), TAG,
                             "MASTER_ACTIVATION err");
         ESP_RETURN_ON_ERROR(panel_epaper_wait_busy(panel), TAG, "busy after full act");
+        epaper_panel->last_busy_ms = (uint32_t)((esp_timer_get_time() - epaper_panel->act_us) / 1000);
+        // 只对自定义 LUT（看图）生效；阅读灰阶抗锯齿（GRAY）保持原样，看图参数仍在试验
+        if (g_ssd1677_gray_vcom_after >= 0 && epaper_panel->refresh_mode == SSD1677_EPAPER_REFRESH_CUSTOM) {
+            // 灰刷后把 VCOM 拉回指定值（试验：保持上电但不给面板留直流偏压）；下次灰刷重新下发 LUT
+            esp_lcd_panel_io_tx_param(epaper_panel->io, SSD1677_CMD_WRITE_VCOM,
+                                      (uint8_t[]) { (uint8_t)g_ssd1677_gray_vcom_after }, 1);
+            epaper_panel->loaded_lut = EPD_LOADED_LUT_NONE;
+        }
+        if (epaper_panel->refresh_mode == SSD1677_EPAPER_REFRESH_FULL_FAST) {
+            // 0xD7 会从 OTP 重载波形，覆盖 MCU 下发的 LUT；下次须重新下发
+            epaper_panel->loaded_lut = EPD_LOADED_LUT_NONE;
+        }
 #if !SSD1677_EPD_OPT_PATH
         // 非优化：BUSY 完成后补 0x3F 0x01（6081325 位置）。
         ESP_RETURN_ON_ERROR(esp_lcd_panel_io_tx_param(epaper_panel->io, SSD1677_CMD_POST_FULL_UPDATE_OPT,
@@ -233,6 +277,7 @@ esp_err_t epaper_panel_refresh_screen(esp_lcd_panel_t *panel)
         return ESP_OK;
     }
 
+    epaper_panel->act_us = esp_timer_get_time();
     gpio_intr_enable(epaper_panel->busy_gpio_num);
     ESP_RETURN_ON_ERROR(esp_lcd_panel_io_tx_param(epaper_panel->io, SSD1677_CMD_MASTER_ACTIVATION, NULL, 0), TAG,
                         "MASTER_ACTIVATION err");
@@ -342,6 +387,7 @@ static esp_err_t epaper_panel_reset(esp_lcd_panel_t *panel)
         ESP_RETURN_ON_ERROR(esp_lcd_panel_io_tx_param(epaper_panel->io, SSD1677_CMD_SWRST, NULL, 0), TAG, "SWRST err");
     }
     epaper_panel->loaded_lut = EPD_LOADED_LUT_NONE; // HW/soft reset 后芯片 LUT 失效
+    epaper_panel->analog_on = false;
     return panel_epaper_wait_busy(panel);
 }
 
@@ -380,10 +426,42 @@ static esp_err_t epaper_panel_load_fast_lut(esp_lcd_panel_t *panel)
     return ESP_OK;
 }
 
+/* 局刷 LUT 的可调副本：组0/组1 帧数、帧率可在运行时改（串口 PLUT 调参，定稿后写回默认值） */
+int g_ssd1677_gray_vcom_after = 0;   /* 灰刷后把 VCOM 拉回 0：保持上电但不留直流偏压（-1 不改，调试用） */
+uint8_t g_ssd1677_gray_ctrl2 = 0xCC;     /* 灰刷/自定义 LUT 的 0x22：不在波形后掉电（掉电那一下会推偏灰阶）*/
+/* 局刷 0x22：0xCF = 刷完立刻断电（原版做法）。0 = 刷完保持上电、连续翻页只发 0x0C（快约 0.1s），
+ * 但保持上电期间整屏发灰、留白印子（用户 2.1.40～2.1.54 实测，改回 0xCF 后明显好转），默认不用。 */
+uint8_t g_ssd1677_partial_ctrl2 = 0xCF;
+static uint8_t s_lut_partial[112];
+static bool s_lut_partial_init = false;
+static uint8_t *partial_lut(void)
+{
+    if (!s_lut_partial_init) {
+        memcpy(s_lut_partial, kEpdLutPartial, sizeof(s_lut_partial));
+        s_lut_partial[50] = EPD_PARTIAL_TP0;
+        s_lut_partial[55] = EPD_PARTIAL_TP1;
+        s_lut_partial_init = true;
+    }
+    return s_lut_partial;
+}
+
+void epaper_panel_set_partial_timing(esp_lcd_panel_t *panel, int tp0, int tp1, int fr)
+{
+    uint8_t *l = partial_lut();
+    if (tp0 > 0 && tp0 < 256) l[50] = (uint8_t)tp0;
+    if (tp1 >= 0 && tp1 < 256) l[55] = (uint8_t)tp1;
+    if (fr > 0 && fr < 256) memset(&l[100], fr, 5);
+    if (panel) {
+        epaper_panel_t *epaper_panel = __containerof(panel, epaper_panel_t, base);
+        epaper_panel->loaded_lut = EPD_LOADED_LUT_NONE;  // 下次局刷重新下发
+    }
+    ESP_LOGD(TAG, "partial lut tp0=%d tp1=%d fr=0x%02x", l[50], l[55], l[100]);
+}
+
 static esp_err_t epaper_panel_load_partial_lut(esp_lcd_panel_t *panel)
 {
     epaper_panel_t *epaper_panel = __containerof(panel, epaper_panel_t, base);
-    ESP_RETURN_ON_ERROR(epaper_panel_load_lut(panel, kEpdLutPartial, EPD_LUT_PARTIAL_WAVE_BYTES), TAG,
+    ESP_RETURN_ON_ERROR(epaper_panel_load_lut(panel, partial_lut(), EPD_LUT_PARTIAL_WAVE_BYTES), TAG,
                         "partial lut load");
     epaper_panel->loaded_lut = EPD_LOADED_LUT_PARTIAL;
     return ESP_OK;
@@ -398,12 +476,22 @@ static esp_err_t epaper_panel_load_gray_lut(esp_lcd_panel_t *panel)
     return ESP_OK;
 }
 
+esp_err_t epaper_panel_load_custom_lut(esp_lcd_panel_t *panel, const uint8_t *lut112)
+{
+    ESP_RETURN_ON_FALSE(panel && lut112, ESP_ERR_INVALID_ARG, TAG, "custom lut null");
+    epaper_panel_t *epaper_panel = __containerof(panel, epaper_panel_t, base);
+    ESP_RETURN_ON_ERROR(epaper_panel_load_lut(panel, lut112, 105), TAG, "custom lut load");
+    epaper_panel->loaded_lut = EPD_LOADED_LUT_CUSTOM;
+    return ESP_OK;
+}
+
 static esp_err_t epaper_panel_init(esp_lcd_panel_t *panel)
 {
     epaper_panel_t *epaper_panel = __containerof(panel, epaper_panel_t, base);
     esp_lcd_panel_io_handle_t io = epaper_panel->io;
 
     ESP_RETURN_ON_ERROR(esp_lcd_panel_io_tx_param(io, SSD1677_CMD_SWRST, NULL, 0), TAG, "SWRST err");
+    epaper_panel->analog_on = false;
     vTaskDelay(pdMS_TO_TICKS(10));
     epaper_panel->loaded_lut = EPD_LOADED_LUT_NONE;
 
@@ -549,6 +637,7 @@ static esp_err_t epaper_panel_disp_on_off(esp_lcd_panel_t *panel, bool on_off)
         ESP_RETURN_ON_ERROR(esp_lcd_panel_io_tx_param(epaper_panel->io, SSD1677_CMD_DISP_UPDATE_CTRL2,
                                                       (uint8_t[]) { SSD1677_PARAM_DISP_UPDATE_POWER_ON }, 1), TAG,
                             "power on err");
+        epaper_panel->analog_on = (SSD1677_PARAM_DISP_UPDATE_POWER_ON & 0x40) != 0;
         ESP_RETURN_ON_ERROR(esp_lcd_panel_io_tx_param(epaper_panel->io, SSD1677_CMD_MASTER_ACTIVATION, NULL, 0), TAG,
                             "power on activation err");
         return panel_epaper_wait_busy(panel);
@@ -557,9 +646,19 @@ static esp_err_t epaper_panel_disp_on_off(esp_lcd_panel_t *panel, bool on_off)
     ESP_RETURN_ON_ERROR(esp_lcd_panel_io_tx_param(epaper_panel->io, SSD1677_CMD_DISP_UPDATE_CTRL2,
                                                   (uint8_t[]) { SSD1677_PARAM_DISP_UPDATE_POWER_OFF }, 1), TAG,
                         "power off err");
+    epaper_panel->analog_on = false;
     ESP_RETURN_ON_ERROR(esp_lcd_panel_io_tx_param(epaper_panel->io, SSD1677_CMD_MASTER_ACTIVATION, NULL, 0), TAG,
                         "power off activation err");
     return panel_epaper_wait_busy(panel);
+}
+
+uint32_t epaper_panel_last_busy_ms(esp_lcd_panel_t *panel)
+{
+    if (!panel) {
+        return 0;
+    }
+    epaper_panel_t *epaper_panel = __containerof(panel, epaper_panel_t, base);
+    return epaper_panel->last_busy_ms;
 }
 
 esp_err_t epaper_panel_prepare_for_partial(esp_lcd_panel_t *panel)
@@ -574,11 +673,52 @@ esp_err_t epaper_panel_prepare_for_partial(esp_lcd_panel_t *panel)
     return ESP_OK;
 }
 
+uint8_t epaper_panel_last_ctrl2(esp_lcd_panel_t *panel)
+{
+    if (!panel) return 0;
+    epaper_panel_t *epaper_panel = __containerof(panel, epaper_panel_t, base);
+    return epaper_panel->last_ctrl2;
+}
+
+bool epaper_panel_analog_on(esp_lcd_panel_t *panel)
+{
+    if (!panel) return false;
+    epaper_panel_t *epaper_panel = __containerof(panel, epaper_panel_t, base);
+    return epaper_panel->analog_on;
+}
+
+esp_err_t epaper_panel_park_vcom(esp_lcd_panel_t *panel)
+{
+    ESP_RETURN_ON_FALSE(panel, ESP_ERR_INVALID_ARG, TAG, "panel is NULL");
+    epaper_panel_t *epaper_panel = __containerof(panel, epaper_panel_t, base);
+    if (!epaper_panel->analog_on || epaper_panel->loaded_lut == EPD_LOADED_LUT_NONE) return ESP_ERR_NOT_FINISHED;  // 没事可做
+    if (gpio_get_level(epaper_panel->busy_gpio_num)) return ESP_ERR_INVALID_STATE;  // BUSY 高：还在刷
+    // 刷完保持上电时 VCOM 还挂着（局刷 LUT 里是 0x30），整屏像素一直受直流偏压：不动的白慢慢发灰、
+    // 刚刷过的地方更白，翻几页就「整体变灰 + 白印子」（用户实测）。拉回 0，下次刷新重新下发 LUT（含 VCOM）
+    ESP_RETURN_ON_ERROR(esp_lcd_panel_io_tx_param(epaper_panel->io, SSD1677_CMD_WRITE_VCOM, (uint8_t[]) { 0x00 }, 1),
+                        TAG, "park vcom err");
+    epaper_panel->loaded_lut = EPD_LOADED_LUT_NONE;
+    return ESP_OK;
+}
+
+esp_err_t epaper_panel_power_off_if_on(esp_lcd_panel_t *panel)
+{
+    ESP_RETURN_ON_FALSE(panel, ESP_ERR_INVALID_ARG, TAG, "panel is NULL");
+    epaper_panel_t *epaper_panel = __containerof(panel, epaper_panel_t, base);
+    if (!epaper_panel->analog_on) return ESP_OK;
+    ESP_RETURN_ON_ERROR(panel_epaper_wait_busy(panel), TAG, "busy before power off");
+    return epaper_panel_disp_on_off(panel, false);
+}
+
 esp_err_t epaper_panel_deep_sleep(esp_lcd_panel_t *panel)
 {
     ESP_RETURN_ON_FALSE(panel, ESP_ERR_INVALID_ARG, TAG, "panel is NULL");
     epaper_panel_t *epaper_panel = __containerof(panel, epaper_panel_t, base);
 
+    if (epaper_panel->analog_on) {
+        (void)epaper_panel_power_off_if_on(panel);  // 先正常掉电再进深睡
+    }
+    epaper_panel->analog_on = false;
     ESP_RETURN_ON_ERROR(esp_lcd_panel_io_tx_param(epaper_panel->io, SSD1677_CMD_DEEP_SLEEP,
                                                   (uint8_t[]) { SSD1677_PARAM_DEEP_SLEEP }, 1), TAG,
                         "DEEP_SLEEP err");

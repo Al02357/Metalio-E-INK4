@@ -8,6 +8,16 @@
 #include "web_socket.h"
 
 
+#include <atomic>
+
+static std::atomic<bool> s_blocked{false};
+static std::atomic<int> s_live{0};
+void EspNetwork_SetBlocked(bool blocked) { s_blocked.store(blocked); }
+bool EspNetwork_Blocked() { return s_blocked.load(); }
+int EspNetwork_LiveSockets() { return s_live.load(); }
+void EspNetwork_SocketCreated() { s_live.fetch_add(1); }
+void EspNetwork_SocketDestroyed() { s_live.fetch_sub(1); }
+
 EspNetwork::EspNetwork() {
 
 }

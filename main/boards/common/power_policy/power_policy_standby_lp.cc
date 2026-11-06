@@ -1,4 +1,6 @@
 #include "power_policy_priv.h"
+#include "display/screen/standby_screen/standby_card.h"
+#include "battery_log.h"
 
 #include "power_hw.h"
 #include "standby_screen/standby_screen.h"
@@ -165,6 +167,11 @@ bool DelayMsWithStandbyKeyPoll(uint32_t delay_ms)
         if (PollStandbyPhysicalKeys()) {
             return true;
         }
+        if (StandbyCard_DebugAutoExitDue()) {
+            StandbyCard_DbgLog("debug auto exit");
+            pwr::RequestDismissStandbyOverlay();
+            return true;
+        }
         const uint32_t step_ms = (delay_ms - elapsed_ms > 50) ? 50 : (delay_ms - elapsed_ms);
         vTaskDelay(pdMS_TO_TICKS(step_ms));
         elapsed_ms += step_ms;
@@ -271,6 +278,13 @@ bool RunLightSleepSlice()
     if (slice > pwr::kLightSleepSliceUs) {
         slice = pwr::kLightSleepSliceUs;
     }
+    if (StandbyCard_ClockActive()) {
+        // 时钟：对齐到下一个整分钟醒
+        const long long to_min = StandbyCard_UsToNextMinute();
+        if (to_min > 0 && static_cast<uint64_t>(to_min) < slice) {
+            slice = static_cast<uint64_t>(to_min);
+        }
+    }
     if (slice < 1000) {
         slice = 1000;
     }
@@ -282,11 +296,24 @@ bool RunLightSleepSlice()
     ESP_LOGD(TAG, "LP slice enter light sleep max_us=%llu",
              static_cast<unsigned long long>(slice));
     PowerPolicy::DebugSetLpPhase("pre_sleep");
-    power_hw_light_sleep_once(slice);
+    const esp_err_t sleep_err = power_hw_light_sleep_once(slice);
     PowerPolicy::DebugSetLpPhase("post_sleep");
 
     const esp_sleep_wakeup_cause_t cause = esp_sleep_get_wakeup_cause();
     ESP_LOGD(TAG, "LP slice wake cause=%d", static_cast<int>(cause));
+    {
+        static int s_last_cause = -1;
+        static esp_err_t s_last_err = ESP_OK;
+        static int s_repeat = 0;
+        if (static_cast<int>(cause) != s_last_cause || sleep_err != s_last_err || ++s_repeat >= 30) {
+            StandbyCard_DbgLog("wake cause=%d err=0x%x(%s) slice=%ums (x%d)", static_cast<int>(cause),
+                               static_cast<unsigned>(sleep_err), esp_err_to_name(sleep_err),
+                               static_cast<unsigned>(slice / 1000), s_repeat);
+            s_last_cause = static_cast<int>(cause);
+            s_last_err = sleep_err;
+            s_repeat = 0;
+        }
+    }
     if (cause == ESP_SLEEP_WAKEUP_GPIO) {
         if (HandleGpioWakeFromLightSleep()) {
             return true;
@@ -302,12 +329,21 @@ bool RunLightSleepSlice()
         pwr::standby_elapsed_us += static_cast<int64_t>(slice);
         OpenStandbyAwakeSegmentLocked();
         xSemaphoreGive(pwr::mu);
+        StandbyCard_ClockTick(false);
+        BatteryLog_MaybeSample(true);  // 待机也每 10 分钟记一次电量
         return false;
     }
     ESP_LOGD(TAG, "light sleep wake cause=%d, skip slice", static_cast<int>(cause));
     xSemaphoreTake(pwr::mu, portMAX_DELAY);
     OpenStandbyAwakeSegmentLocked();
     xSemaphoreGive(pwr::mu);
+    // 浅睡被拒（不是定时/按键唤醒）：别 50ms 空转，按普通延时睡满这一片，时钟照走
+    if (sleep_err != ESP_OK) {
+        const uint32_t ms = static_cast<uint32_t>(slice / 1000) > 1000 ? 1000 : static_cast<uint32_t>(slice / 1000);
+        if (DelayMsWithStandbyKeyPoll(ms)) return true;
+        StandbyCard_ClockTick(false);
+        return false;
+    }
     vTaskDelay(pdMS_TO_TICKS(50));
     return false;
 }
@@ -331,10 +367,19 @@ bool RunDelaySlice()
     if (slice < 1000) {
         slice = 1000;
     }
+    if (StandbyCard_ClockActive()) {
+        const long long to_min = StandbyCard_UsToNextMinute();
+        if (to_min > 0 && static_cast<uint64_t>(to_min) < slice) slice = static_cast<uint64_t>(to_min);
+    }
     const uint32_t delay_ms = static_cast<uint32_t>(slice / 1000 > 0 ? slice / 1000 : 1);
     ESP_LOGD(TAG, "LP slice delay %lu ms (light sleep off, elapsed %ld s)",
              static_cast<unsigned long>(delay_ms), static_cast<long>(elapsed_s));
-    return DelayMsWithStandbyKeyPoll(delay_ms);
+    const bool key = DelayMsWithStandbyKeyPoll(delay_ms);
+    if (!key) {
+        StandbyCard_ClockTick(false);
+        BatteryLog_MaybeSample(true);
+    }
+    return key;
 }
 
 bool StandbyLpShouldContinue()
@@ -376,7 +421,7 @@ bool RunStandbyLpMainLoop()
         }
 
         const bool key_done =
-            pwr::kStandbyLpUseLightSleep ? RunLightSleepSlice() : RunDelaySlice();
+            (pwr::kStandbyLpUseLightSleep && !StandbyCard_DebugNoSleepOn()) ? RunLightSleepSlice() : RunDelaySlice();
         if (key_done) {
             return true;
         }
@@ -424,6 +469,8 @@ void StandbyLpTask(void* /*arg*/)
             PowerPolicy::DebugSetLpPhase("epd_park");
             // settle 攒帧完毕：全刷待机画面后冻结 flush
             StandbyScreen::EnterEpdSleep();
+            StandbyCard_DbgLog("LP session: parked");
+            StandbyCard_ClockTick(true);  // 信息卡顶部画上当前时间
             RunStandbyLpMainLoop();
         }
 

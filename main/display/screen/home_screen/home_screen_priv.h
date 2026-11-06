@@ -40,8 +40,10 @@ constexpr const char* kScreenId = "home";
 constexpr lv_coord_t kIconSize = 70;
 constexpr lv_coord_t kCardRadius = 20;
 constexpr int kColsPerRow = 3;
-constexpr int kRowsPerPage = 4;
+// 与可见行数一致：超过 6 个 App 时分页，而不是被容器裁掉
+constexpr int kRowsPerPage = HOME_APPS_VISIBLE_ROWS;
 constexpr int kAppsPerPage = kColsPerRow * kRowsPerPage;
+constexpr int kSlashAppsPerPage = HOME_SLASH_ROWS * 2; // 斜切宫格：3 行 × 2 列
 constexpr int kDitherW = 8;
 constexpr int kDitherH = 8;
 constexpr uint8_t kBayer4[4][4] = {

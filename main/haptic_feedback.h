@@ -15,7 +15,9 @@ extern "C" {
 bool HapticIsEnabled(void);
 void HapticSetEnabled(bool enabled);
 
-/** 震动强度：0 弱(默认) / 1 中 / 2 强 */
+/** 震动强度档位数 */
+#define HAPTIC_LEVELS 7
+/** 震动强度：0..HAPTIC_LEVELS-1，越大越强 */
 int HapticGetIntensity(void);
 void HapticSetIntensity(int intensity);
 

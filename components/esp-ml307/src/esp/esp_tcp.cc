@@ -1,6 +1,8 @@
+#include "esp_network.h"
 #include "esp_tcp.h"
 
 #include <esp_log.h>
+#include <esp_netif.h>
 #include <unistd.h>
 #include <cstring>
 #include <arpa/inet.h>
@@ -16,10 +18,12 @@ static const char *TAG = "EspTcp";
 constexpr int kConnectTimeoutSec = 15;
 
 EspTcp::EspTcp() {
+    EspNetwork_SocketCreated();
     event_group_ = xEventGroupCreate();
 }
 
 EspTcp::~EspTcp() {
+    EspNetwork_SocketDestroyed();
     // 先回收接收任务，再清回调、删 event group。析构里不再通知：
     // owner 可能正在拆自己，回调进已半析构的对象是 UAF。
     ShutdownAndJoin();
@@ -36,6 +40,11 @@ EspTcp::~EspTcp() {
 }
 
 bool EspTcp::Connect(const std::string& host, int port) {
+    // 离线模式开机时 WiFi/lwip 从没起过：此时调 DNS/socket 会 assert(Invalid mbox) 重启
+    if (EspNetwork_Blocked() || esp_netif_get_default_netif() == nullptr) {
+        ESP_LOGW(TAG, "network stack not started, skip connect %s", host.c_str());
+        return false;
+    }
     bool had_session = false;
     {
         std::lock_guard<std::mutex> lock(mutex_);

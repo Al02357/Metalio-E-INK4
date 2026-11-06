@@ -31,4 +31,5 @@ idf_component_register(
         "esp-tls"
         "pthread"
         "mqtt"
+        "esp_netif"
 )

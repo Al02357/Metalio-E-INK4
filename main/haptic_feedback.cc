@@ -14,15 +14,12 @@ namespace {
 constexpr const char* TAG = "Haptic";
 constexpr const char* kNvsNs = "display";
 constexpr const char* kNvsKey = "haptic";
-constexpr const char* kNvsIntensityKey = "haptic_lvl";
+constexpr const char* kNvsIntensityKey = "haptic_lvl";   // 旧：0 弱 / 1 中 / 2 强
+constexpr const char* kNvsLevelKey = "haptic_lv7";        // 新：7 档 0..6
 constexpr bool kDefaultEnabled = true;
-constexpr int kIntensityWeak = 0; // 弱
-constexpr int kIntensityMedium = 1; // 中
-constexpr int kIntensityStrong = 2; // 强
-constexpr int kDefaultIntensity = kIntensityWeak;
-constexpr int kPulseMsWeak = 35; // 弱脉宽 ms
-constexpr int kPulseMsMedium = 50; // 中脉宽 ms
-constexpr int kPulseMsStrong = 70; // 强脉宽 ms
+// 7 档震动：档位越高脉宽越长（马达转得越久，手感越重）
+constexpr int kPulseMs[HAPTIC_LEVELS] = {18, 25, 32, 40, 50, 60, 72};
+constexpr int kDefaultIntensity = 2;  // 32ms，接近原来的「弱」
 
 // LVGL USER_1：标记已挂震动回调，避免重复 Attach 导致连震。
 constexpr lv_obj_flag_t kHapticBoundFlag = LV_OBJ_FLAG_USER_1;
@@ -49,27 +46,23 @@ size_t s_zone_count = 0;
 portMUX_TYPE s_zone_mux = portMUX_INITIALIZER_UNLOCKED;
 
 int ClampIntensity(int intensity) {
-    if (intensity == kIntensityMedium || intensity == kIntensityStrong) {
-        return intensity;
-    }
-    return kIntensityWeak;
+    return intensity < 0 ? 0 : (intensity >= HAPTIC_LEVELS ? HAPTIC_LEVELS - 1 : intensity);
 }
 
-int PulseMsForIntensity(int intensity) {
-    switch (ClampIntensity(intensity)) {
-        case kIntensityMedium:
-            return kPulseMsMedium;
-        case kIntensityStrong:
-            return kPulseMsStrong;
-        default:
-            return kPulseMsWeak;
-    }
-}
+int PulseMsForIntensity(int intensity) { return kPulseMs[ClampIntensity(intensity)]; }
 
 void LoadFromNvs() {
     Settings settings(kNvsNs, false);
     s_enabled = settings.GetBool(kNvsKey, kDefaultEnabled);
-    s_intensity = ClampIntensity(settings.GetInt(kNvsIntensityKey, kDefaultIntensity));
+    const int lv7 = settings.GetInt(kNvsLevelKey, -1);
+    if (lv7 >= 0) {
+        s_intensity = ClampIntensity(lv7);
+    } else {
+        // 从旧的三档迁移：弱→3 档(32ms) 中→5 档(50ms) 强→7 档(72ms)
+        static const int kMap[3] = {2, 4, 6};
+        const int old = settings.GetInt(kNvsIntensityKey, 0);
+        s_intensity = kMap[(old >= 0 && old <= 2) ? old : 0];
+    }
     s_ready = true;
     ESP_LOGI(TAG, "nvs load haptic=%d intensity=%d (%dms)", s_enabled ? 1 : 0, s_intensity,
              PulseMsForIntensity(s_intensity));
@@ -84,7 +77,7 @@ void EnsureReady() {
 void PersistTask(void* /*arg*/) {
     Settings settings(kNvsNs, true);
     settings.SetBool(kNvsKey, s_enabled);
-    settings.SetInt(kNvsIntensityKey, s_intensity);
+    settings.SetInt(kNvsLevelKey, s_intensity);
     ESP_LOGI(TAG, "nvs save haptic=%d intensity=%d", s_enabled ? 1 : 0, s_intensity);
     vTaskDelete(nullptr);
 }

@@ -14,6 +14,7 @@
 #include "display/screen/settings_screen/settings_test/settings_test_aging_screen.h"
 #include "display/screen/standby_screen/standby_screen.h"
 #include "display/screen/vk_key_handler.h"
+#include "feedback.h"
 #include "IOExpander.hpp"
 #include "power_policy.h"
 
@@ -174,6 +175,7 @@ void MetalioButtons_Init(Button& boot, Button& power, std::unique_ptr<Button>& v
                 return;
             }
             auto* codec = board->GetAudioCodec();
+            codec->SetMuted(false);  // 音量+ 顺带解除一键静音
             int volume = codec->output_volume() + 10;
             if (volume > 100) {
                 volume = 100;
@@ -270,9 +272,9 @@ void MetalioButtons_Init(Button& boot, Button& power, std::unique_ptr<Button>& v
                 VkKey_OnLongPress("vk_next");
                 return;
             }
-            board->GetAudioCodec()->SetOutputVolume(0);
-            ESP_LOGI(TAG, "VOLUME_DOWN long: volume=0 (muted)");
-            board->GetDisplay()->ShowNotification(Lang::Strings::MUTED);
+            // 长按音量下 = 记录问题反馈（原来是静音，几乎不用）
+            ESP_LOGI(TAG, "VOLUME_DOWN long: feedback capture");
+            feedback::Capture("vol-down long press");
         });
         volume_down->OnPressUp([]() {
             if (BatteryUvLockout_IsActive()) {

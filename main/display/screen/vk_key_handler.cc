@@ -1,4 +1,6 @@
+#include "my_ai_screen/my_ai_screen.h"
 #include "vk_key_handler.h"
+#include "quick_panel.h"
 
 #include "vk_page_repeat.h"
 
@@ -241,6 +243,15 @@ void VkKey_AttachScreen(lv_obj_t* scr, const char* name, const VkKeyScreenDesc& 
 
 void VkKey_Dispatch(const char* key_name) {
     if (key_name == nullptr) {
+        return;
+    }
+    // 快捷面板打开时：盖板键只用来收起
+    if (QuickPanel::IsOpen()) {
+        QuickPanel::RequestClose();
+        return;
+    }
+    if (MyAiScreen::OverlayOpen()) {
+        MyAiScreen::RequestOverlayClose();
         return;
     }
     if (BatteryUvLockout_IsActive()) {

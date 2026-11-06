@@ -1,6 +1,8 @@
+#include "esp_network.h"
 #include "esp_udp.h"
 
 #include <esp_log.h>
+#include <esp_netif.h>
 #include <unistd.h>
 #include <cstring>
 #include <arpa/inet.h>
@@ -24,6 +26,11 @@ EspUdp::~EspUdp() {
 }
 
 bool EspUdp::Connect(const std::string& host, int port) {
+    // 离线模式开机时 WiFi/lwip 从没起过：此时调 DNS/socket 会 assert(Invalid mbox) 重启
+    if (EspNetwork_Blocked() || esp_netif_get_default_netif() == nullptr) {
+        ESP_LOGW(TAG, "network stack not started, skip connect %s", host.c_str());
+        return false;
+    }
     // 确保先断开已有连接
     if (connected_) {
         Disconnect();

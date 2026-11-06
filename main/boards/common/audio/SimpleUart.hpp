@@ -2,6 +2,7 @@
 #define SIMPLE_UART_HPP
 
 #include <driver/uart.h>
+#include <freertos/idf_additions.h>
 #include <freertos/FreeRTOS.h>
 #include <freertos/task.h>
 #include <functional>
@@ -63,7 +64,9 @@ public:
         m_initialized = true;
         
         // 创建接收任务
-        xTaskCreate(uartReceiveTask, "uart_rx_task", 4096, this, 10, &m_rxTaskHandle);
+        // 栈放 PSRAM：只读 UART、回调里解析 AT 回包，不写 Flash
+        xTaskCreateWithCaps(uartReceiveTask, "uart_rx_task", 4096, this, 10, &m_rxTaskHandle,
+                            MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
         
         return true;
     }
@@ -103,7 +106,7 @@ public:
     void end() {
         if (m_initialized) {
             if (m_rxTaskHandle != nullptr) {
-                vTaskDelete(m_rxTaskHandle);
+                vTaskDeleteWithCaps(m_rxTaskHandle);  // 栈在 PSRAM，须配对释放
                 m_rxTaskHandle = nullptr;
             }
             

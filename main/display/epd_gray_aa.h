@@ -36,6 +36,14 @@ void epd_gray_aa_plot_logical(int32_t lx, int32_t ly, uint8_t mask_val);
  * @note ~85 浅灰、~170 深灰；0/255 保持 BW 底
  */
 void epd_gray_aa_pack_overlay_plane(uint8_t* out, int plane_msb);
+/** 同上；black_lsb 非 0 时覆盖度 255 的像素只进 LSB 平面（LUT 行 1，看图给纯黑补压用） */
+void epd_gray_aa_pack_overlay_plane_ex(uint8_t* out, int plane_msb, int black_lsb);
+
+/** @brief 清空 sidecar（看图用，不受 aa 开关影响） */
+void epd_gray_aa_clear(void);
+
+/** @brief 直接写逻辑坐标覆盖度（看图用，不受帧/aa 开关影响）：170=深灰 85=浅灰 */
+void epd_gray_aa_set_logical(int32_t lx, int32_t ly, uint8_t cov);
 
 #ifdef __cplusplus
 }

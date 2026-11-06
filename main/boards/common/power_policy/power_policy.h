@@ -32,6 +32,7 @@ enum class PowerNeed : uint8_t {
     UiKeepNet,     // 翻译页保网满频；本页不参与 PA_en
     UsbVirtualDisk, // 虚拟 U 盘启用：不计无操作进待机（不硬占网）
     StandbyInhibit, // 产测老化等：禁止无操作进待机；不硬占网、不驱动 PA（PA 仍靠 DeviceState）
+    BgDownload,     // 后台下载（微信读书离线缓存）：锁屏后先保网保电，等下载完再真正待机（屏幕照样显示锁屏）
     kCount
 };
 
@@ -78,6 +79,16 @@ public:
      * @brief 请求立即重算电源档位
      */
     void RequestReevaluate();
+
+    /**
+     * @brief 锁屏画面在显示、但因后台下载还没进真正待机（键盘仍走普通路径）
+     */
+    bool IsLockedButAwake();
+
+    /**
+     * @brief 上面这种状态下按电源键解锁：清待机请求标志（调用方再去 Dismiss 锁屏画面）
+     */
+    void PrepareUnlockFromAwake();
 
     /**
      * @brief 待机 Overlay 已关闭：清待机请求并重算

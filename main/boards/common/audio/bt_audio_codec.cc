@@ -71,7 +71,7 @@ int BTAudioCodec::Write(const int16_t *data, int samples)
 
     // output_volume_: 0-100
     // volume_factor_: 0-65536
-    int32_t volume_factor = pow(double(output_volume_) / 100.0, 2) * 65536;
+    int32_t volume_factor = muted_ ? 0 : static_cast<int32_t>(pow(double(output_volume_) / 100.0, 2) * 65536);
 
     for (int i = 0; i < samples; i++)
     {

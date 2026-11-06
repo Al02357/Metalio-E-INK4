@@ -1,6 +1,7 @@
 #pragma once
 
 #include <stdbool.h>
+#include <stddef.h>
 
 #ifdef __cplusplus
 extern "C" {
@@ -37,6 +38,9 @@ void SdLogWriter_SetEnabled(bool enabled);
  * @note FatFS 仅 fflush 时目录 size 常仍为 0，须 fclose 后二次打开才能读到内容
  */
 void SdLogWriter_Flush(void);
+
+/** 把运行日志最近 max_bytes 字节按时间顺序拷到 dst_path，返回拷了多少字节 */
+size_t SdLogWriter_ExportTail(const char* dst_path, size_t max_bytes);
 
 /**
  * @brief 上传占用开始：停采环/写盘并刷盘关句柄（不改 NVS 用户开关）

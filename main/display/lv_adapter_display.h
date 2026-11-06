@@ -1,4 +1,7 @@
 #pragma once
+#include <string>
+
+#include <vector>
 
 #include <esp_lcd_panel_io.h>
 #include <esp_lcd_panel_ops.h>
@@ -83,6 +86,52 @@ public:
     void ParkEpdForStandby();
     // 退出待机后恢复 flush，并在下一帧底层画面走全刷。
     void WakeEpdFromStandby();
+    /** 待机冻结期间直接在帧缓冲顶部画「HH:MM」并局刷（不经 LVGL）。成功返回 true。 */
+    /** 返回 0 成功；1 未冻结/无缓冲；2 局刷失败（*err 写 esp_err）；3 无变化 */
+    int StandbyDrawClock(int hh, int mm, int* err = nullptr);
+    /**
+     * 看图：在已上屏的黑白底（灰像素画成黑）上叠 4 级灰。
+     * g2 为逻辑坐标 (x0,y0) 起 w×h 的 2bpp（高位在左；0 黑 1 深灰 2 浅灰 3 白）。
+     * 须在非 LVGL 线程调用；LVGL 还没把底图刷上屏时会等（最多 timeout_ms）。返回 0 成功。
+     */
+    int ApplyGray4Overlay(const uint8_t* g2, int x0, int y0, int w, int h, int timeout_ms = 4000);
+    /**
+     * 看图：一次刷出 4 级灰（自定义完整波形：先黑白闪两下清屏，再从白往黑按灰度推不同时长）。
+     * 调用前先 SetAbsorbFlush(true) 再让 LVGL 画黑白底：底图只进帧缓冲不上屏，本函数一次刷完。
+     */
+    int ApplyGray4Single(const uint8_t* g2, int x0, int y0, int w, int h, int timeout_ms = 4000);
+    /** 打开后 LVGL 的刷屏只更新帧缓冲、不驱动屏幕（ApplyGray4Single 会关掉） */
+    void SetAbsorbFlush(bool on);
+    /**
+     * 看图保灰：任何一次刷新都会扰动屏上的灰像素（记黑的被压黑、记白的被推白）。
+     * 打开后，只落在顶部 top_h 行（状态栏）里的重画先攒着不上屏；有别的区域要重画时自动解除。
+     */
+    void SetGrayHold(bool on, int top_h = 0);
+    /**
+     * 调看图灰度波形（单位：帧）。which=0 叠加：a=深灰提亮帧数 b=浅灰提亮帧数（都为 0 = 用阅读器原表）；
+     * which=1 一次刷：a=清屏每步帧数 b=浅灰 c=深灰 d=黑 加深帧数。fr=帧率字节（0 不改）。
+     */
+    static void SetGrayLut(int which, int a, int b, int c, int d, int fr);
+    /** 刷底叠加是不是「白底往黑推」（底图里灰画成白） */
+    static bool GrayOverlayFromWhite();
+    /** 原始触摸回调（touch_feed 任务里调用，逻辑坐标）；period_ms 为触摸轮询周期，0 = 默认 10ms */
+    /** 调试：只给原始触摸钩子喂一段直线拖动 */
+    static void DebugRawDrag(int x0, int y0, int x1, int y1, int ms);
+    static void SetTouchRawHook(void (*hook)(bool down, int x, int y), int period_ms);
+    /** 调试：串口模拟一次点按（逻辑坐标，按住 hold_ms 毫秒） */
+    static void DebugTap(int x, int y, int hold_ms);
+    /** 反馈用：墨水屏刷新计数等状态，一行文本 */
+    std::string DebugInfo();
+    static void GetGrayLut(int which, int out[5]);
+
+    // 调试截屏：拷贝面板原生 1bpp 帧（1=白，行优先，stride=w/8）。优先取尚未上屏的合并帧。
+    bool CopyPanelFrame(std::vector<uint8_t>& out, int* w, int* h);
+
+    // 墨水屏全刷频率：每 n 次局刷后全刷一次清残影（全刷时会黑白闪）；0 = 不自动全刷
+    static int GetFullRefreshEvery();
+    static void SetFullRefreshEvery(int n);  // 立即生效并写 NVS
+    // 立即全刷一次（须在 LVGL 线程调用）
+    void RequestFullRefreshNow();
 
     /** 待机 overlay 显示后：停 touch_feed（已在跑才生效；勿关全局 lv_timer，否则 lv_async dismiss 失效） */
     void PauseStandbyBackgroundWork();

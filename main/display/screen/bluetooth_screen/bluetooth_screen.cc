@@ -243,7 +243,7 @@ void Bluetooth_on_scan_clicked(lv_event_t* /*e*/) {
         return;
     }
     SimpleUart::getInstance().sendString("AT+INQUIRING\r\n");
-    ESP_LOGD(TAG, "TX: AT+INQUIRING");
+    ESP_LOGI(TAG, "TX: AT+INQUIRING");
     Bluetooth_devices.clear();
     Bluetooth_post_clear_list();
     Bluetooth_post_status(Lang::Strings::BT_SCAN_START);
@@ -403,10 +403,10 @@ void BluetoothScreen::ApplyDefaultMode() {
         return;
     }
     uart.sendString("AT+RX=2\r\n");
-    ESP_LOGD(TAG, "TX: AT+RX=2");
+    ESP_LOGI(TAG, "TX: AT+RX=2");
     vTaskDelay(pdMS_TO_TICKS(700));
     uart.sendString("AT+MODE=1\r\n");
-    ESP_LOGD(TAG, "TX: AT+MODE=1");
+    ESP_LOGI(TAG, "TX: AT+MODE=1");
     // 勿在此拉 PA：MAIN_PWR 恢复也会走本函数，进百问会 PA on→off。
     // PA 仅由 PowerPolicy（Speaking / BtAudio / 电话）按需开关。
 }

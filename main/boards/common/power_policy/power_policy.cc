@@ -296,6 +296,11 @@ pwr::Mode EvaluateLocked()
         return EvaluateProvisioningLocked();
     }
     if (StandbyScreen::IsActive()) {
+        // 锁屏了但后台还在下载：先不停网、不掉电，下载完 Release 时再评估进真正待机
+        if (NeedHeld(PowerNeed::BgDownload) && !pwr::shutdown_requested) {
+            pwr::ClearNetGraceLocked();
+            return pwr::Mode::NetActive;
+        }
         return pwr::Mode::StandbyUi;
     }
     if (NeedsHardNetActiveLocked()) {
@@ -581,10 +586,23 @@ void QueueMainRailForModeLocked(bool want_off)
     }
 }
 
+/** AppIdle 降频，但刚操作过 20 秒内保持满频：WiFi 照样停着省电，界面渲染不用在 80MHz 下慢 3 倍 */
+int CpuMhzForModeLocked(Mode m)
+{
+    if (m != Mode::AppIdle) {
+        return CONFIG_ESP_DEFAULT_CPU_FREQ_MHZ;
+    }
+    const int64_t since = esp_timer_get_time() - last_user_activity_us;
+    return since < 20LL * 1000000 ? CONFIG_ESP_DEFAULT_CPU_FREQ_MHZ : idle_cpu_mhz;
+}
+
 void ApplyLocked(Mode next)
 {
     if (board == nullptr) {
         return;
+    }
+    if (next == mode && next == Mode::AppIdle) {
+        QueueCpuMhzLocked(CpuMhzForModeLocked(next));  // 档位没变，频率随「刚操作过」变
     }
 
     const Mode prev = mode;
@@ -636,7 +654,7 @@ void ApplyLocked(Mode next)
         WakeTouchLocked();
     }
 
-    const int want_mhz = (next == Mode::AppIdle) ? idle_cpu_mhz : CONFIG_ESP_DEFAULT_CPU_FREQ_MHZ;
+    const int want_mhz = CpuMhzForModeLocked(next);
     const bool want_pa =
         !NeedHeld(PowerNeed::UiKeepNet) &&
         ((next == Mode::Full) || (next == Mode::NetActive && DeviceWantsPa(device_state)));
@@ -865,7 +883,14 @@ void PowerPolicy::NotifyUserActivity()
 
     pwr::last_user_activity_us = now;
     pwr::ClearNetGraceLocked();
+    const bool boost = pwr::mode == pwr::Mode::AppIdle;
+    if (boost) {
+        pwr::QueueCpuMhzLocked(CONFIG_ESP_DEFAULT_CPU_FREQ_MHZ);  // 一碰屏幕立刻升满频
+    }
     xSemaphoreGive(pwr::mu);
+    if (boost) {
+        pwr::FlushCpuFreqOutsideLock();
+    }
 }
 
 bool PowerPolicy::IsTouchAsleep() const
@@ -877,6 +902,28 @@ bool PowerPolicy::IsTouchAsleep() const
     const bool asleep = pwr::touch_asleep;
     xSemaphoreGive(pwr::mu);
     return asleep;
+}
+
+bool PowerPolicy::IsLockedButAwake()
+{
+    if (pwr::mu == nullptr) {
+        return false;
+    }
+    xSemaphoreTake(pwr::mu, portMAX_DELAY);
+    const bool r = StandbyScreen::IsActive() && pwr::mode != pwr::Mode::StandbyUi;
+    xSemaphoreGive(pwr::mu);
+    return r;
+}
+
+void PowerPolicy::PrepareUnlockFromAwake()
+{
+    if (pwr::mu == nullptr) {
+        return;
+    }
+    xSemaphoreTake(pwr::mu, portMAX_DELAY);
+    pwr::PrepareStandbyWakeExitLocked();
+    pwr::last_user_activity_us = esp_timer_get_time();
+    xSemaphoreGive(pwr::mu);
 }
 
 void PowerPolicy::PreparePowerKeyStandby()

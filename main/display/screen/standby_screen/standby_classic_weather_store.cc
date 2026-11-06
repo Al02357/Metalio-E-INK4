@@ -197,7 +197,14 @@ bool StandbyClassic_WeatherRamIsToday() {
         return false;
     }
     std::lock_guard<std::mutex> lock(StandbyClassic_weather_mu);
-    return StandbyClassic_weather.valid && std::strcmp(StandbyClassic_weather_day, today) == 0;
+    if (!StandbyClassic_weather.valid || std::strcmp(StandbyClassic_weather_day, today) != 0) {
+        return false;
+    }
+    // 自建天气（按位置）2 小时刷新一次；原厂接口仍是一天一次
+    if (StandbyClassic_weather.fetched_at == 0) {
+        return false;
+    }
+    return time(nullptr) - StandbyClassic_weather.fetched_at < 2 * 3600;
 }
 
 WeatherSnap StandbyClassic_WeatherRamCopy() {
@@ -230,8 +237,14 @@ bool StandbyClassic_LoadWeatherFromNvs(WeatherSnap& out, char* day_out, size_t d
     strlcpy(out.text, text.c_str(), sizeof(out.text));
     strlcpy(out.icon_code, icon.c_str(), sizeof(out.icon_code));
     strlcpy(out.lunar, lunar.c_str(), sizeof(out.lunar));
+    strlcpy(out.city, settings.GetString("city").c_str(), sizeof(out.city));
     out.has_temp = settings.GetBool("ht", false);
     out.temp = settings.GetInt("temp", 0);
+    out.has_range = settings.GetBool("hr", false);
+    out.tmin = settings.GetInt("tmin", 0);
+    out.tmax = settings.GetInt("tmax", 0);
+    strlcpy(out.tomorrow, settings.GetString("tmr").c_str(), sizeof(out.tomorrow));
+    out.fetched_at = settings.GetInt("at", 0);  // 重启前拉的：保留拉取时刻（锁屏卡据此标「几点的数据」）
     out.valid = (out.text[0] != '\0') || out.has_temp;
     if (out.valid && !settings.GetBool("lunar_ok", false)) {
         return false;
@@ -248,8 +261,14 @@ void StandbyClassic_SaveWeatherToNvs(const WeatherSnap& snap, const char* day) {
     settings.SetString("text", snap.text);
     settings.SetString("icon", snap.icon_code);
     settings.SetString("lunar", snap.lunar);
+    settings.SetString("city", snap.city);
     settings.SetInt("temp", snap.temp);
     settings.SetBool("ht", snap.has_temp);
+    settings.SetBool("hr", snap.has_range);
+    settings.SetInt("tmin", snap.tmin);
+    settings.SetInt("tmax", snap.tmax);
+    settings.SetString("tmr", snap.tomorrow);
+    settings.SetInt("at", static_cast<int32_t>(snap.fetched_at));
     settings.SetBool("lunar_ok", true);
     ESP_LOGI(TAG, "weather nvs saved day=%s text=%s temp=%d icon=%s lunar=%s", day, snap.text,
              snap.temp, snap.icon_code, snap.lunar);

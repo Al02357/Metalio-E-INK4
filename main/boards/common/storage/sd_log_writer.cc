@@ -560,6 +560,44 @@ void SdLogWriter_Flush(void) {
     xSemaphoreGive(s_file_mu);
 }
 
+size_t SdLogWriter_ExportTail(const char* dst_path, size_t max_bytes) {
+    if (dst_path == nullptr || s_file_mu == nullptr) {
+        return 0;
+    }
+    SdLogWriter_Flush();
+    size_t copied = 0;
+    xSemaphoreTake(s_file_mu, portMAX_DELAY);
+    FILE* in = fopen(kLogFilePath, "rb");
+    FILE* out = in ? fopen(dst_path, "wb") : nullptr;
+    if (in && out) {
+        struct stat st {};
+        const size_t size = stat(kLogFilePath, &st) == 0 ? static_cast<size_t>(st.st_size) : 0;
+        // 环形文件：没写满时按顺序；写满后最新的数据在 s_write_pos 之前
+        const bool wrapped = size >= kMaxFileBytes;
+        const size_t pos = wrapped ? (s_write_pos < size ? s_write_pos : 0) : size;
+        const size_t want = size < max_bytes ? size : max_bytes;
+        // 从「最新位置往前 want 字节」开始，按环形顺序读到最新位置
+        size_t start = (pos + size - want) % (size ? size : 1);
+        char* buf = static_cast<char*>(heap_caps_malloc(4096, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
+        while (buf && copied < want) {
+            size_t n = want - copied;
+            if (n > 4096) n = 4096;
+            if (start + n > size) n = size - start;
+            if (fseek(in, static_cast<long>(start), SEEK_SET) != 0) break;
+            const size_t r = fread(buf, 1, n, in);
+            if (r == 0) break;
+            fwrite(buf, 1, r, out);
+            copied += r;
+            start = (start + r) % size;
+        }
+        heap_caps_free(buf);
+    }
+    if (out) fclose(out);
+    if (in) fclose(in);
+    xSemaphoreGive(s_file_mu);
+    return copied;
+}
+
 void SdLogWriter_BeginUploadHold(void) {
     if (s_upload_hold < 255) {
         ++s_upload_hold;

@@ -89,11 +89,28 @@ void epd_gray_aa_plot_logical(int32_t lx, int32_t ly, uint8_t mask_val) {
     Plot(px, py, mask_val);
 }
 
+void epd_gray_aa_clear(void) {
+    if (s_l8 != nullptr) std::memset(s_l8, 0, s_l8_bytes);
+}
+
+void epd_gray_aa_set_logical(int32_t lx, int32_t ly, uint8_t cov) {
+    if (s_l8 == nullptr || s_w <= 0 || s_h <= 0) return;
+    int px = 0, py = 0;
+    DisplayUiLogicalToPanel(static_cast<int>(lx), static_cast<int>(ly), &px, &py);
+    if (px < 0 || py < 0 || px >= s_w || py >= s_h) return;
+    s_l8[static_cast<size_t>(py) * static_cast<size_t>(s_w) + static_cast<size_t>(px)] = cov;
+}
+
 void epd_gray_aa_pack_overlay_plane(uint8_t* out, int plane_msb) {
+    epd_gray_aa_pack_overlay_plane_ex(out, plane_msb, 0);
+}
+
+void epd_gray_aa_pack_overlay_plane_ex(uint8_t* out, int plane_msb, int black_lsb) {
     if (out == nullptr || s_l8 == nullptr || s_plane_bytes == 0) {
         return;
     }
     const bool want_msb = plane_msb != 0;
+    const bool black_on = black_lsb != 0 && !want_msb;  // 看图：纯黑 (255) 只在 LSB 平面 → LUT 行 1
     for (size_t bi = 0; bi < s_plane_bytes; ++bi) {
         uint8_t byte = 0;
         for (int bit = 7; bit >= 0; --bit) {
@@ -108,6 +125,8 @@ void epd_gray_aa_pack_overlay_plane(uint8_t* out, int plane_msb) {
                 on = want_msb ? 1 : 0;
             } else if (cov >= 128 && cov < 255) {
                 // ~170 → 深灰 11：LSB+MSB
+                on = 1;
+            } else if (cov == 255 && black_on) {
                 on = 1;
             }
             if (on) {

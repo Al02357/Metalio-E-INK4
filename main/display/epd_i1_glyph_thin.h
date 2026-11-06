@@ -12,6 +12,7 @@
 #include <stdint.h>
 
 #include "epd_gray_aa.h"
+#include "epd_i1_fast_blit.h"  /* 仅在 LVGL blend_to_i1.c 里定义快速拷贝钩子 */
 
 #ifdef __cplusplus
 extern "C" {

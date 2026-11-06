@@ -438,6 +438,11 @@ lv_obj_t* SettingsScreen::Create() {
     return CreateInternal();
 }
 
+lv_obj_t* SettingsScreen::CreateTheme() {
+    s_pending_tab = SettingsTab::kTheme;
+    return CreateInternal();
+}
+
 lv_obj_t* SettingsScreen::CreateTest() {
     s_pending_tab = SettingsTab::kTest;
     return CreateInternal();

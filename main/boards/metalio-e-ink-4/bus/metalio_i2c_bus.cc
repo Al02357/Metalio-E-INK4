@@ -34,6 +34,8 @@ static void MetalioI2cBus_RecoverPins() {
     esp_rom_delay_us(5);
 }
 
+static i2c_master_bus_handle_t s_last_bus = nullptr;
+
 void MetalioI2cBus_Create(i2c_master_bus_handle_t* bus) {
     if (bus == nullptr) {
         return;
@@ -57,4 +59,7 @@ void MetalioI2cBus_Create(i2c_master_bus_handle_t* bus) {
             },
     };
     ESP_ERROR_CHECK(i2c_new_master_bus(&bus_config, bus));
+    s_last_bus = *bus;
 }
+
+i2c_master_bus_handle_t MetalioI2cBus_Get() { return s_last_bus; }

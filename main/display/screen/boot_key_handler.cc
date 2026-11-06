@@ -1,4 +1,6 @@
+#include <cstring>
 #include "boot_key_handler.h"
+#include "my_ai_screen/my_ai_screen.h"
 
 #include <atomic>
 
@@ -19,6 +21,12 @@
 static constexpr const char* TAG = "BootKey";
 static std::atomic<bool> s_boot_held{false};
 static std::atomic<bool> s_long_press_fired{false};
+
+/** 自己处理 BOOT 键、且自己占用麦克风的页面：我的AI、百问、翻译、蓝牙键鼠（按住说话） */
+static bool IsAiScreen(const char* screen) {
+    return screen != nullptr && (std::strcmp(screen, "my_ai") == 0 || std::strcmp(screen, "assistant") == 0 ||
+                                 std::strcmp(screen, "translate") == 0 || std::strcmp(screen, "blehid") == 0);
+}
 
 static bool DispatchBootAction(BootKeyAction action, const char* kind, const char* screen) {
     if (action == nullptr) {
@@ -85,6 +93,7 @@ void BootKey_OnPressUp() {
         return;
     }
     s_boot_held.store(false, std::memory_order_release);
+    if (MyAiScreen::OverlayBootPressUp()) return;
     const char* screen = VkKey_ActiveScreen();
     ESP_LOGD(TAG, "press-up on screen=%s", screen);
     DispatchBootAction(VkKey_GetBootPressUp(screen), "press-up", screen);
@@ -112,7 +121,13 @@ void BootKey_OnClick() {
     }
     const char* screen = VkKey_ActiveScreen();
     ESP_LOGI(TAG, "short-press on screen=%s", screen);
-    // 仅页内钩子（如百问打断）；进/出待机只走电源键短按
+    // 我的AI 浮层打开时：短按停止 / 关闭
+    if (MyAiScreen::OverlayBootClick()) return;
+    // 全局：除「我的AI」「百问」和待机外，短按 = 叠出我的AI 浮层，带当前页面截图作上下文
+    if (!StandbyScreen::IsActive() && !IsAiScreen(screen)) {
+        MyAiScreen::RequestOverlay(false);
+        return;
+    }
     DispatchBootAction(VkKey_GetBootClick(screen), "short-press", screen);
 }
 
@@ -170,6 +185,13 @@ void BootKey_OnLongPress() {
     }
     const char* screen = VkKey_ActiveScreen();
     ESP_LOGI(TAG, "long-press on screen=%s", screen);
+    // 浮层打开时：长按再问一句
+    if (MyAiScreen::OverlayBootLongPress()) return;
+    // 全局：除「我的AI」「百问」外，长按 = 叠出我的AI 浮层并直接开始听（带当前页面截图，松手发送）
+    if (!IsAiScreen(screen)) {
+        MyAiScreen::RequestOverlay(true);
+        return;
+    }
     DispatchBootAction(VkKey_GetBootLongPress(screen), "long-press", screen);
 }
 
@@ -186,6 +208,15 @@ void PowerKey_OnClick() {
         return;
     }
     if (StandbyScreen::IsActive()) {
+        if (PowerPolicy::GetInstance().IsLockedButAwake()) {
+            // 锁屏了但后台下载还没完（没进浅睡）：电源键照样解锁
+            ESP_LOGI(TAG, "power short -> unlock (bg download)");
+            PowerPolicy::GetInstance().PrepareUnlockFromAwake();
+            ScreenLvAsync([](void*) {
+                if (StandbyScreen::IsActive()) StandbyScreen::Dismiss();
+            });
+            return;
+        }
         // 待机 Overlay 期间 iot_button 已挂起，不应到达此处
         ESP_LOGW(TAG, "power short in standby (unexpected iot path)");
         return;

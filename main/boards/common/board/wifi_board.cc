@@ -19,6 +19,7 @@
 #include <algorithm>
 #include <font_awesome.h>
 #include <wifi_station.h>
+#include "net_mode.h"
 #include <ssid_manager.h>
 #include <esp_wifi.h>
 
@@ -43,7 +44,7 @@ void BumpEnsureDeadlineUs(int64_t deadline_us) {
 
 /** STA 关/未起时拉起；已连上则 no-op */
 void EnsureWifiRadioUp(WifiStation& wifi) {
-    if (wifi.IsConnected()) {
+    if (wifi.IsConnected() || net_mode::Offline()) {
         return;
     }
     if (wifi.IsLpPaused()) {
@@ -92,6 +93,10 @@ void WifiBoard::StartNetwork() {
         wifi_config_mode_ = false;
     }
 
+    if (net_mode::Offline()) {
+        ESP_LOGW(TAG, "offline mode: skip WiFi start");
+        return;
+    }
     auto& ssid_manager = SsidManager::GetInstance();
     auto ssid_list = ssid_manager.GetSsidList();
     if (ssid_list.empty()) {
@@ -101,6 +106,11 @@ void WifiBoard::StartNetwork() {
 
     auto& wifi_station = WifiStation::GetInstance();
     wifi_station.OnScanBegin([this]() {
+        // 没有已知 WiFi 时每 10 秒扫一次：提示只在 5 分钟内出一次，免得墨水屏反复局刷
+        static int64_t last_us = 0;
+        const int64_t now = esp_timer_get_time();
+        if (last_us != 0 && now - last_us < 5LL * 60 * 1000000) return;
+        last_us = now;
         auto display = Board::GetInstance().GetDisplay();
         display->ShowNotification(Lang::Strings::SCANNING_WIFI, 30000);
         display->UpdateStatusBar(true);
@@ -180,6 +190,9 @@ bool WifiBoard::EnsureNetworkReady(int timeout_ms) {
              wifi.IsConnected() ? 1 : 0);
     if (wifi.IsConnected()) {
         return true;
+    }
+    if (net_mode::Offline()) {
+        return false;  // 离线模式：不拉 WiFi，立即失败
     }
     // SoftAP 配网无 STA 互联网，空等只会拖死主循环/业务线程
     if (wifi_config_mode_) {
@@ -296,15 +309,16 @@ const char* WifiBoard::GetNetworkStateIcon() {
         }
         return FONT_AWESOME_WIFI_WEAK;
     }
-    // 扫描/连接中：弱→中→强循环，避免一直 slash 看不出进度
+    // 扫描/连接中：开始找网的前 30 秒弱→中→强轮换（看得出在连）；一直找不到就固定成弱信号，
+    // 免得墨水屏每秒局刷一直闪。停下来超过 60 秒再开始找，重新计时
     if (wifi_station.IsLinkInProgress()) {
-        static const char* kBusyIcons[] = {
-            FONT_AWESOME_WIFI_WEAK,
-            FONT_AWESOME_WIFI_FAIR,
-            FONT_AWESOME_WIFI,
-        };
-        const int phase = static_cast<int>((esp_timer_get_time() / 1000000) % 3);
-        return kBusyIcons[phase];
+        static int64_t busy_since = 0, last_busy = 0;
+        const int64_t now = esp_timer_get_time();
+        if (last_busy == 0 || now - last_busy > 60LL * 1000000) busy_since = now;
+        last_busy = now;
+        if (now - busy_since > 30LL * 1000000) return FONT_AWESOME_WIFI_WEAK;
+        static const char* kBusyIcons[] = {FONT_AWESOME_WIFI_WEAK, FONT_AWESOME_WIFI_FAIR, FONT_AWESOME_WIFI};
+        return kBusyIcons[static_cast<int>((now / 1000000) % 3)];
     }
     return FONT_AWESOME_WIFI_SLASH;
 }
