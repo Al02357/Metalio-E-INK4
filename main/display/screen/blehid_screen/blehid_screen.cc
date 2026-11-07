@@ -462,7 +462,7 @@ void OnDrag(lv_event_t*) {
 std::atomic<bool> s_tilt{false};
 TaskHandle_t s_tilt_task = nullptr;
 bool s_axis_swap = true;  // 用户实测：x/y 对调且都反向
-int s_axis_sx = -1, s_axis_sy = -1;
+int s_axis_sx = -1, s_axis_sy = 1;  // 上下方向用户实测后又反了一次
 
 // 倾斜死区（mg，约 1mg ≈ 0.057°）：长按「倾斜」在 小 / 中 / 大 之间换
 const int kTiltDead[3] = {90, 140, 210};  // 约 5° / 8° / 12°
