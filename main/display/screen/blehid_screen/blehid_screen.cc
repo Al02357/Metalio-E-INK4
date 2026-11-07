@@ -906,15 +906,15 @@ void LeaveKb() {
 
 // ---------------------------------------------------------------- 遥控：上下两大块翻页，适合盲按
 
-enum class FlipKind : uint8_t { kKey, kConsumer, kSwipe, kTap };
+enum class FlipKind : uint8_t { kKey, kConsumer, kWheel, kTap };
 struct PageMode {
     const char* name;
     FlipKind kind;
     uint16_t prev, next;
 };
-// 上下滑：手机刷短视频（抖音）；左右点：手机阅读 App 点屏幕两侧翻页；
+// 滚轮：鼠标滚轮滚一格（电脑网页 / 文档、手机短视频）；左右点：手机阅读 App 点屏幕两侧翻页；
 // 方向键：电脑放映 / 看图 / 网页；音量键：开了「音量键翻页」的阅读 App；翻页键：PgUp/PgDn
-const PageMode kPageModes[] = {{"上下滑", FlipKind::kSwipe, 0, 0},   {"左右点", FlipKind::kTap, 0, 0},
+const PageMode kPageModes[] = {{"滚轮", FlipKind::kWheel, 0, 0},   {"左右点", FlipKind::kTap, 0, 0},
                                {"方向键", FlipKind::kKey, 0x50, 0x4F}, {"音量键", FlipKind::kConsumer, 0xE9, 0xEA},
                                {"翻页键", FlipKind::kKey, 0x4B, 0x4E}};
 constexpr int kPageModeCount = sizeof(kPageModes) / sizeof(kPageModes[0]);
@@ -925,9 +925,8 @@ void OnFlip(lv_event_t* e) {
     const bool next = lv_event_get_user_data(e) != nullptr;
     const auto& m = kPageModes[s_page_mode];
     switch (m.kind) {
-        case FlipKind::kSwipe:  // 下一条 = 手指往上滑
-            if (next) ble_hid::Swipe(5000, 7000, 5000, 3000);
-            else ble_hid::Swipe(5000, 3000, 5000, 7000);
+        case FlipKind::kWheel:  // 鼠标滚轮滚一格：下一页 = 往下滚
+            ble_hid::Mouse(0, 0, next ? -1 : 1, 0);
             break;
         case FlipKind::kTap:
             ble_hid::Tap(next ? 9000 : 1000, 5000);
